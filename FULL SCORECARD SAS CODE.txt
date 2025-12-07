@@ -1,0 +1,3386 @@
+libname credit '/our/path/';
+
+proc import datafile="/our/path/CORPORATE_PD_SCORECARD_BASE.csv"
+    out=credit.corporate_pd_base
+    dbms=csv
+    replace;
+    guessingrows=max;
+run;
+proc freq data=credit.corporate_pd_base;
+   tables segment industry region facility_type restructuring_flag default_flag;
+run;
+data credit.corporate_pd_binned;
+    set credit.corporate_pd_base;
+
+    /* Internal rating */
+    if 1 <= rating_internal <= 3 then rating_band = '1-3';
+    else if 4 <= rating_internal <= 5 then rating_band = '4-5';
+    else if 6 <= rating_internal <= 7 then rating_band = '6-7';
+    else rating_band = '8-10';
+
+    /* Leverage */
+    if leverage_ratio < 1 then lev_band = '<1.0';
+    else if leverage_ratio < 2 then lev_band = '1.0-1.9';
+    else if leverage_ratio < 3 then lev_band = '2.0-2.9';
+    else lev_band = '3.0+';
+
+    /* Interest cover */
+    if interest_cover < 2 then ic_band = '<2x';
+    else if interest_cover < 4 then ic_band = '2-4x';
+    else if interest_cover < 6 then ic_band = '4-6x';
+    else ic_band = '6x+';
+
+    /* Past-due */
+    if past_due_12m = 0 then pdue_band = '0';
+    else if past_due_12m <= 2 then pdue_band = '1-2';
+    else pdue_band = '3+';
+
+    /* EBITDA margin */
+    if ebitda_margin < 5 then margin_band = '<5%';
+    else if ebitda_margin < 15 then margin_band = '5-14%';
+    else if ebitda_margin < 25 then margin_band = '15-24%';
+    else margin_band = '25%+';
+
+    /* Restructuring */
+    if restructuring_flag = 1 then restr_band = 'Yes';
+    else restr_band = 'No';
+run;
+
+STEP 4 — WOE and IV Calculation
+We use a clean macro.
+SAS Code
+
+%macro woe_iv(in_ds=, out_ds=, target=, bandvar=);
+
+    /* Aggregate good and bad */
+    proc sql;
+        create table _agg as
+        select &bandvar as band,
+               sum(case when &target = 0 then 1 else 0 end) as good,
+               sum(case when &target = 1 then 1 else 0 end) as bad
+        from &in_ds
+        group by &bandvar;
+    quit;
+
+    /* Calculate total good and bad */
+    proc sql noprint;
+        select sum(good), sum(bad)
+        into :totgood, :totbad
+        from _agg;
+    quit;
+
+    /* Compute WOE and IV */
+    data &out_ds;
+        set _agg;
+        good_share = good / &totgood;
+        bad_share  = bad  / &totbad;
+
+        if good_share > 0 and bad_share > 0 then
+            woe = log(good_share / bad_share);
+        else woe = 0;
+
+        iv = (good_share - bad_share) * woe;
+    run;
+
+%mend;
+
+%woe_iv(in_ds=credit.corporate_pd_binned, out_ds=woe_rating, target=default_flag, bandvar=rating_band);
+%woe_iv(in_ds=credit.corporate_pd_binned, out_ds=woe_lev,    target=default_flag, bandvar=lev_band);
+%woe_iv(in_ds=credit.corporate_pd_binned, out_ds=woe_ic,     target=default_flag, bandvar=ic_band);
+%woe_iv(in_ds=credit.corporate_pd_binned, out_ds=woe_margin, target=default_flag, bandvar=margin_band);
+%woe_iv(in_ds=credit.corporate_pd_binned, out_ds=woe_pdue,   target=default_flag, bandvar=pdue_band);
+%woe_iv(in_ds=credit.corporate_pd_binned, out_ds=woe_restr,  target=default_flag, bandvar=restr_band);
+
+In the book, we include tables showing strong IV values:
+•	rating_band → strong predictor
+•	lev_band → strong
+•	pdue_band → strong
+•	restr_band → very strong
+•	ic_band → moderate
+•	margin_band → weak to moderate
+
+Combine all IV tables into one master table
+
+data iv_master;
+    length variable $32;
+    set 
+        woe_rating  (in=a) 
+        woe_lev     (in=b)
+        woe_ic      (in=c)
+        woe_margin  (in=d)
+        woe_pdue    (in=e)
+        woe_restr   (in=f);
+
+    if a then variable = 'rating_band';
+    if b then variable = 'lev_band';
+    if c then variable = 'ic_band';
+    if d then variable = 'margin_band';
+    if e then variable = 'pdue_band';
+    if f then variable = 'restr_band';
+run;
+
+proc sql;
+    create table iv_summary as
+    select variable,
+           sum(iv) as total_iv format=8.4
+    from iv_master
+    group by variable
+    order by calculated total_iv desc;
+quit;
+
+data iv_classified;
+    set iv_summary;
+    length strength $20;
+
+    if total_iv >= 0.50 then strength = 'Very Strong';
+    else if 0.30 <= total_iv < 0.50 then strength = 'Strong';
+    else if 0.10 <= total_iv < 0.30 then strength = 'Medium';
+    else if 0.02 <= total_iv < 0.10 then strength = 'Weak';
+    else strength = 'Useless';
+run;
+
+data iv_classified;
+    set iv_summary;
+    length strength $20;
+
+    if total_iv >= 0.50 then strength = 'Very Strong';
+    else if 0.30 <= total_iv < 0.50 then strength = 'Strong';
+    else if 0.10 <= total_iv < 0.30 then strength = 'Medium';
+    else if 0.02 <= total_iv < 0.10 then strength = 'Weak';
+    else strength = 'Useless';
+run;
+
+proc print data=iv_classified label noobs;
+    var variable total_iv strength;
+    label variable="Predictor"
+          total_iv="Information Value"
+          strength="Predictive Strength";
+run;
+proc sql noprint;
+    select variable
+    into :keep_vars separated by ' '
+    from iv_classified
+    where strength in ('Very Strong', 'Strong', 'Medium');
+quit;
+
+%put &=keep_vars;
+
+Optionally, list variables to drop:
+
+proc sql noprint;
+    select variable
+    into :drop_vars separated by ' '
+    from iv_classified
+    where strength in ('Weak', 'Useless');
+quit;
+%put &=drop_vars;
+
+
+/* 1. Base binned dataset (already exists) */
+/* credit.corporate_pd_binned */
+
+data credit.corp_pd_binned_model;
+    set credit.corporate_pd_binned;
+    /* We will NOT use restr_band in the model (IV too low) */
+run;
+
+/* Prepare each WOE table with proper names */
+data w_rating; 
+    set woe_rating(keep=band woe);
+    rename band = rating_band woe = woe_rating;
+run;
+
+data w_lev; 
+    set woe_lev(keep=band woe);
+    rename band = lev_band woe = woe_lev;
+run;
+
+data w_ic; 
+    set woe_ic(keep=band woe);
+    rename band = ic_band woe = woe_ic;
+run;
+
+data w_margin; 
+    set woe_margin(keep=band woe);
+    rename band = margin_band woe = woe_margin;
+run;
+
+data w_pdue; 
+    set woe_pdue(keep=band woe);
+    rename band = pdue_band woe = woe_pdue;
+run;
+
+proc sql;
+    create table credit.corp_pd_woe as
+    select a.*,
+           b.woe_rating,
+           c.woe_lev,
+           d.woe_ic,
+           e.woe_margin,
+           f.woe_pdue
+    from credit.corp_pd_binned_model as a
+    left join w_rating b on a.rating_band  = b.rating_band
+    left join w_lev    c on a.lev_band     = c.lev_band
+    left join w_ic     d on a.ic_band      = d.ic_band
+    left join w_margin e on a.margin_band  = e.margin_band
+    left join w_pdue   f on a.pdue_band    = f.pdue_band;
+quit;
+
+
+2.7 /* Logistic regression on WOE variables */
+proc logistic data=credit.corp_pd_woe descending;
+    model default_flag =
+        woe_rating
+        woe_lev
+        woe_ic
+        woe_margin
+        woe_pdue
+    / selection=none;
+    output out=credit.corp_pd_model p=pred_pd;
+run;
+
+/* Bring scoring constants */
+/* Step 1: Compute new PDO-based scaling factors */
+%let pdo   = 40;   /* changed from 20 → 40 */
+%let base  = 600;  /* same base score */
+%let odds  = 50;   /* same anchor odds */
+
+%let factor_new = %sysevalf(&pdo / %sysfunc(log(2)));
+%let offset_new = %sysevalf(&base - (&factor_new * %sysfunc(log(&odds))));
+
+/* Step 2: Apply the new score formula */
+data credit.corp_pd_score_rescaled;
+    set credit.corp_pd_model;   /* same data, same PD */
+    log_odds = log((1 - pred_pd) / pred_pd);
+    score_rescaled = (&factor_new * log_odds) + &offset_new;
+run;
+
+/* Step 3: Check new score range */
+proc means data=credit.corp_pd_score_rescaled n min p1 p5 p25 p50 p75 p90 p95 max;
+    var score_rescaled;
+run;
+
+Next Step — Validate Cut-offs With Actual Data
+
+data credit.corp_pd_final;
+    set credit.corp_pd_score_rescaled;
+
+    length decision $10;
+
+    if score_rescaled >= 600 then decision = "APPROVE";
+    else if score_rescaled >= 525 then decision = "REVIEW";
+    else decision = "REJECT";
+run;
+
+proc freq data=credit.corp_pd_final;
+    tables decision*default_flag / norow nocol nopercent;
+run;
+
+proc means data=credit.corp_pd_final mean;
+    class decision;
+    var pred_pd score_rescaled;
+run;
+
+data credit.pd_profile_scored;
+    set credit.PD_BASE;   /* Or corporate_pd_base / retail_pd_base as required */
+
+    length profile_band $40;
+    length profile_points 8;
+
+    /****************************************************
+    * STEP 1: ASSIGN PROFILE SEGMENT (BUSINESS RULES)
+    ****************************************************/
+    if years_in_business >= 10 then 
+        profile_band = "Established & Low Risk";
+
+    else if years_in_business between 5 and 9 then
+        profile_band = "Moderate Business Strength";
+
+    else if employment_type in ("Self-employed","Business Owner") then
+        profile_band = "Emerging / Medium Risk";
+
+    else 
+        profile_band = "High Risk / Thin File / Other";
+
+    /****************************************************
+    * STEP 2: ASSIGN SCORECARD POINTS
+    ****************************************************/
+    select (profile_band);
+        when ("Established & Low Risk")               profile_points = 35;
+        when ("Moderate Business Strength")           profile_points = 55;
+        when ("Emerging / Medium Risk")               profile_points = 70;
+        when ("High Risk / Thin File / Other")        profile_points = 90;
+        otherwise                                     profile_points = .;
+    end;
+
+run;
+
+/****************************************************
+* STEP 3: QUALITY CHECK
+****************************************************/
+proc freq data=credit.pd_profile_scored;
+    tables profile_band;
+run;
+
+proc means data=credit.pd_profile_scored n mean min max;
+    var profile_points;
+run;
+
+Step 3 — SAS Code to Generate Financial Strength Band + Points
+________________________________________
+/*********************************************************************/
+/* STEP 1: CREATE FINANCIAL STRENGTH BANDS                          */
+/* Business Rules: Combine leverage, interest cover, profitability  */
+/*********************************************************************/
+data credit.pd_financial_scored;
+    set credit.corporate_pd_base;   /* Our PD base */
+
+    length fin_band $20;
+    length fin_points 8;
+
+    /* Classification Logic */
+    if leverage_ratio < 1 
+       and interest_cover >= 5 
+       and ebitda_margin >= 20 then 
+            fin_band = "Very Strong";
+
+    else if leverage_ratio < 2
+         and interest_cover >= 3 
+         and ebitda_margin >= 10 then
+            fin_band = "Strong";
+
+    else if leverage_ratio < 3
+         and interest_cover >= 1.5 then
+            fin_band = "Moderate";
+
+    else if leverage_ratio >= 3
+         or interest_cover < 1 then
+            fin_band = "Weak";
+
+    else fin_band = "High Risk";
+
+    /**************************************************************
+    * STEP 2: ASSIGN SCORECARD POINTS BASED ON FINANCIAL BAND     *
+    **************************************************************/
+    select (fin_band);
+        when ("Very Strong") fin_points = 30;
+        when ("Strong")      fin_points = 40;
+        when ("Moderate")    fin_points = 55;
+        when ("Weak")        fin_points = 75;
+        when ("High Risk")   fin_points = 95;
+        otherwise            fin_points = .;
+    end;
+run;
+
+/*********************************************************************/
+/* STEP 3: QUALITY CHECKS                                            */
+/*********************************************************************/
+proc freq data=credit.pd_financial_scored;
+    tables fin_band;
+run;
+
+proc means data=credit.pd_financial_scored n mean min max;
+    var fin_points;
+run;
+/****************************************************************************************
+* PD SCORECARD — BEHAVIOURAL DETERIORATION                                             *
+* Uses arrears, restructuring, and combined signals to classify PD behavioural bands   *
+****************************************************************************************/
+
+data credit.pd_behaviour_scored;
+    set credit.corporate_pd_base;
+
+    length beh_band $30;
+    length beh_points 8;
+
+    /*************************************************************************
+    STEP 1: ASSIGN BEHAVIOUR BANDS (BUSINESS RULES)
+    *************************************************************************/
+
+    /* Clean Behaviour */
+    if past_due_12m = 0 and restructuring_flag = 0 then
+        beh_band = "Clean Behaviour";
+
+    /* Mild Deterioration */
+    else if past_due_12m = 1 and restructuring_flag = 0 then
+        beh_band = "Mild Deterioration";
+
+    /* Significant Arrears */
+    else if past_due_12m >= 2 and restructuring_flag = 0 then
+        beh_band = "Significant Arrears";
+
+    /* Restructured */
+    else if restructuring_flag = 1 and past_due_12m <= 1 then
+        beh_band = "Restructured Account";
+
+    /* Severe Deterioration (worst category) */
+    else if restructuring_flag = 1 and past_due_12m > 1 then
+        beh_band = "Severe Deterioration";
+
+    /* Fallback for missing */
+    else beh_band = "Unknown";
+
+    /*************************************************************************
+    STEP 2: ASSIGN PD SCORE POINTS
+    *************************************************************************/
+    select (beh_band);
+        when ("Clean Behaviour")        beh_points = 35;
+        when ("Mild Deterioration")     beh_points = 55;
+        when ("Significant Arrears")    beh_points = 75;
+        when ("Restructured Account")   beh_points = 90;
+        when ("Severe Deterioration")   beh_points = 95;
+        otherwise                       beh_points = .;
+    end;
+run;
+
+/*************************************************************************
+STEP 3: SUMMARY CHECKS — DISTRIBUTION AND POINTS VALIDATION
+*************************************************************************/
+
+proc freq data=credit.pd_behaviour_scored;
+    tables beh_band;
+run;
+
+proc means data=credit.pd_behaviour_scored n mean min max;
+    var beh_points;
+run;
+
+Step 3 — SAS Code (With Explanation)
+/*****************************************************************************************
+* PD SCORECARD — INDUSTRY RISK
+* Converts industry category into PD risk band + score points.
+*****************************************************************************************/
+
+data credit.pd_industry_scored;
+    set credit.corporate_pd_base;
+
+    length ind_band $20;
+    length ind_points 8;
+
+    /*************************************************************
+    STEP 1: INDUSTRY RISK BAND
+    Business Rules:
+      - Elevated Risk = Construction, RealEstate, Trading, Hospitality
+      - Moderate Risk = All remaining industries
+    *************************************************************/
+    if industry in ("Construction","RealEstate","Trading","Hospitality") then
+        ind_band = "Elevated";
+    else
+        ind_band = "Moderate";
+
+    /*************************************************************
+    STEP 2: ASSIGN PD SCORE POINTS
+    *************************************************************/
+    select (ind_band);
+        when ("Moderate") ind_points = 60; /* Stable industry */
+        when ("Elevated") ind_points = 70; /* Cyclical industry */
+        otherwise        ind_points = .;   /* Data issue */
+    end;
+
+run;
+
+/*********************************************************************
+STEP 3: SCORECARD QUALITY CHECK
+*********************************************************************/
+proc freq data=credit.pd_industry_scored;
+    tables ind_band;
+run;
+
+proc means data=credit.pd_industry_scored n mean min max;
+    var ind_points;
+run;
+
+Step 3 — SAS Code to Generate Facility Risk Band + Points
+
+/*****************************************************************************************
+* PD SCORECARD — FACILITY TYPE RISK                                                     *
+* Converts facility_type into PD risk band & assigns PD scorecard points               *
+*****************************************************************************************/
+
+data credit.pd_facility_scored;
+    set credit.corporate_pd_base;
+
+    length fac_band $20;
+    length fac_points 8;
+
+    /***************************************************************
+    STEP 1: ASSIGN FACILITY RISK BANDS
+    Business Logic:
+      - High Risk: Revolvers, Overdrafts, Cash Credit, Unsecured Loans
+      - Moderate:  Secured Term Loans, Trade/Invoice Finance
+    ***************************************************************/
+
+    /* HIGH RISK PRODUCTS */
+    if facility_type in ("Overdraft","Revolver","CashCredit","UnsecuredLoan") then
+        fac_band = "High Risk";
+
+    /* MODERATE PRODUCTS */
+    else if facility_type in ("SecuredTermLoan","TradeFinance","InvoiceFinance") then
+        fac_band = "Moderate";
+
+    /* DEFAULT / DATA QUALITY */
+    else fac_band = "Moderate";
+
+    /***************************************************************
+    STEP 2: ASSIGN POINTS FOR PD SCORECARD
+    ***************************************************************/
+    select (fac_band);
+        when ("Moderate") fac_points = 60;  /* Mid PD risk */
+        when ("High Risk") fac_points = 85; /* High PD probability */
+        otherwise        fac_points = .;    /* Should not occur */
+    end;
+
+run;
+
+/*****************************************************************
+STEP 3: SUMMARY CHECK (FREQ + SCORE DISTRIBUTION)
+*****************************************************************/
+
+proc freq data=credit.pd_facility_scored;
+    tables fac_band;
+run;
+
+proc means data=credit.pd_facility_scored n mean min max;
+    var fac_points;
+run;
+
+
+/****************************************************************************************
+* PD SCORECARD — EARLY WARNING DELINQUENCY (DPD BEHAVIOUR)
+* Converts DPD patterns into risk bands + PD scorecard points.
+****************************************************************************************/
+
+data credit.pd_dpd_scored;
+    set credit.corporate_pd_base;
+
+    length dpd_band $40;
+    length dpd_points 8;
+
+    /*****************************************************************
+    STEP 1: ASSIGN DPD BEHAVIOUR BAND
+    *****************************************************************/
+
+    /* Clean accounts: no arrears in last 12 months */
+    if past_due_12m = 0 and restructuring_flag = 0 then
+        dpd_band = "Clean Behaviour";
+
+    /* Mild deterioration: small arrears < 30 days */
+    else if past_due_12m > 0 and past_due_12m < 30 and restructuring_flag = 0 then
+        dpd_band = "Mild Deterioration";
+
+    /* Severe arrears: >= 60 days */
+    else if past_due_12m >= 60 then
+        dpd_band = "Severe Deterioration";
+
+    /* Significant arrears: 30–59 days */
+    else if past_due_12m >= 30 and past_due_12m < 60 then
+        dpd_band = "Significant Arrears";
+
+    /* Restructured accounts override all other rules */
+    if restructuring_flag = 1 then
+        dpd_band = "Restructured Account";
+
+
+    /*****************************************************************
+    STEP 2: ASSIGN PD SCORECARD POINTS
+    *****************************************************************/
+    select (dpd_band);
+        when ("Clean Behaviour")        dpd_points = 35;
+        when ("Mild Deterioration")     dpd_points = 55;
+        when ("Significant Arrears")    dpd_points = 75;
+        when ("Severe Deterioration")   dpd_points = 90;
+        when ("Restructured Account")   dpd_points = 95;
+        otherwise                       dpd_points = .;
+    end;
+
+run;
+
+
+/*****************************************************************
+STEP 3: FREQUENCY + SCORE DISTRIBUTION CHECK
+*****************************************************************/
+
+proc freq data=credit.pd_dpd_scored;
+    tables dpd_band;
+run;
+
+proc means data=credit.pd_dpd_scored n mean min max;
+    var dpd_points;
+run;
+/*****************************************************************************************
+* PD SCORECARD — MACROECONOMIC SENSITIVITY
+* Uses borrower industry exposure to determine recession sensitivity → PD score.
+*****************************************************************************************/
+data credit.pd_macro_scored;
+    set credit.corporate_pd_base;
+
+    length macro_band $25;
+    length macro_points 8;
+
+    /*****************************************************************
+    STEP 1: CREATE MACRO SENSITIVITY BAND
+    Business Rules:
+      - High Sensitivity: industries that deteriorate rapidly during recession
+      - Moderate: more stable industries, less correlated with macro shocks
+    *****************************************************************/
+
+    if industry in ("Hospitality","Construction","Airlines","Retail") then
+        macro_band = "High Sensitivity";
+    else
+        macro_band = "Moderate Sensitivity";
+
+    /*****************************************************************
+    STEP 2: ASSIGN SCORE POINTS BASED ON SENSITIVITY
+    *****************************************************************/
+    select (macro_band);
+        when ("Moderate Sensitivity") macro_points = 60; /* More stable → lower PD */
+        when ("High Sensitivity")     macro_points = 75; /* Volatile → higher PD  */
+        otherwise                     macro_points = .;
+    end;
+
+run;
+
+/*****************************************************************
+STEP 3: FREQUENCY CHECK AND SCORE DISTRIBUTION
+*****************************************************************/
+proc freq data=credit.pd_macro_scored;
+    tables macro_band;
+run;
+
+proc means data=credit.pd_macro_scored n min max mean;
+    var macro_points;
+run;
+
+/*****************************************************************************************
+* PD SCORECARD — EXPOSURE CONCENTRATION                                                  *
+* Converts EAD amount into exposure concentration band + PD score points.                *
+*****************************************************************************************/
+data credit.pd_exposure_scored;
+    set credit.corporate_pd_base;
+
+    length exp_band $40;
+    length exp_points 8;
+
+    /*-----------------------------------------------------------
+      STEP 1: EXPOSURE BAND CLASSIFICATION
+      Business rules based on observed distribution
+      (You can update thresholds as per calibrations)
+    -----------------------------------------------------------*/
+
+    if ead < 500000 then
+        exp_band = "Very Small Ticket";
+
+    else if 500000 <= ead < 1500000 then
+        exp_band = "Small Ticket";
+
+    else if 1500000 <= ead < 3000000 then
+        exp_band = "Medium Exposure";
+
+    else if 3000000 <= ead < 6000000 then
+        exp_band = "Large Single Name";
+
+    else if ead >= 6000000 then
+        exp_band = "Very Large / Concentrated";
+
+    else
+        exp_band = "Missing";
+
+
+    /*-----------------------------------------------------------
+      STEP 2: ASSIGN PD SCORECARD POINTS
+    -----------------------------------------------------------*/
+    select (exp_band);
+        when ("Very Small Ticket")       exp_points = 40;
+        when ("Small Ticket")            exp_points = 55;
+        when ("Medium Exposure")         exp_points = 65;
+        when ("Large Single Name")       exp_points = 80;
+        when ("Very Large / Concentrated") exp_points = 90;
+        otherwise                        exp_points = .;
+    end;
+
+run;
+
+
+/*-----------------------------------------------------------
+  STEP 3: PROFILE CHECKS USING FREQ + MEANS
+-----------------------------------------------------------*/
+
+proc freq data=credit.pd_exposure_scored;
+    tables exp_band;
+run;
+
+proc means data=credit.pd_exposure_scored n mean min max;
+    var exp_points;
+run;
+
+proc means data=credit.LGD_SCORECARD_BASE n mean min p25 p50 p75 max;
+    var ead collateral_value recovery_amount recovery_cost
+        time_to_recovery lgd_observed;
+run;
+proc freq data=credit.LGD_SCORECARD_BASE;
+    tables secured_flag collateral_type legal_action_flag restructuring_flag;
+run;
+data credit.lgd_dev;
+    set credit.LGD_SCORECARD_BASE;
+    lgd_flag = (lgd_observed > 0.50);
+run;
+
+proc freq data=credit.lgd_dev;
+    tables lgd_flag;
+run;
+3.3.1 Numeric Binning
+proc rank data=credit.lgd_dev groups=10 out=lgd_binned;
+    var ead collateral_value time_to_recovery recovery_amount recovery_cost;
+    ranks ead_band coll_band ttr_band recamt_band reccost_band;
+run;
+
+3.3.2 Categorical Binning
+data lgd_binned;
+    set lgd_binned;
+    /* secured_flag, collateral_type, legal_action_flag, restructuring_flag 
+       are already categorical, no banding needed */
+run;
+%macro woe(in=, var=, target=, out=);
+    proc sql;
+        create table temp as
+        select &var as band,
+               sum(&target = 0) as good,
+               sum(&target = 1) as bad
+        from &in
+        group by &var;
+    quit;
+
+    proc sql noprint;
+        select sum(good), sum(bad)
+        into :G_TOTAL, :B_TOTAL
+        from temp;
+    quit;
+
+    data &out;
+        set temp;
+        good_pct = good / &G_TOTAL;
+        bad_pct  = bad  / &B_TOTAL;
+        woe = log(good_pct / bad_pct);
+        iv  = (good_pct - bad_pct) * woe;
+    run;
+%mend;
+
+3.5 Step 5 — IV Ranking (Full SAS Code)
+Apply macro to all predictors:
+%woe(in=lgd_binned, var=ead_band,     target=lgd_flag, out=iv_ead);
+%woe(in=lgd_binned, var=coll_band,    target=lgd_flag, out=iv_coll);
+%woe(in=lgd_binned, var=ttr_band,     target=lgd_flag, out=iv_ttr);
+%woe(in=lgd_binned, var=recamt_band,  target=lgd_flag, out=iv_recamt);
+%woe(in=lgd_binned, var=reccost_band, target=lgd_flag, out=iv_reccost);
+%woe(in=lgd_binned, var=secured_flag, target=lgd_flag, out=iv_sec);
+%woe(in=lgd_binned, var=legal_action_flag, target=lgd_flag, out=iv_legal);
+%woe(in=lgd_binned, var=restructuring_flag, target=lgd_flag, out=iv_restr);
+
+Combine IVs:
+data lgd_iv_all;
+    set iv_: indsname=source;
+    variable = source;
+run;
+
+proc sort data=lgd_iv_all;
+    by descending iv;
+run;
+
+proc print data=lgd_iv_all;
+run;
+FULL SAS CODE — LGD Scorecard WOE + Logistic Model
+
+/* Step 1: Create proper LGD flag using median split */
+proc sql noprint;
+    select median(lgd_observed) into :lgd_med
+    from credit.lgd_scorecard_base;
+quit;
+
+data lgd_base;
+    set credit.lgd_scorecard_base;
+
+    /* Binary LGD scorecard flag */
+    if lgd_observed >= &lgd_med then lgd_flag = 1;
+    else lgd_flag = 0;
+run;
+%macro woe_num(data=, var=, target=lgd_flag, id=cust_id, out=);
+
+    /* 1. Fill missing with median */
+    proc sql noprint;
+        select median(&var) into :med from &data;
+    quit;
+
+    data temp_&var;
+        set &data;
+        &var._fix = coalesce(&var, &med);
+    run;
+
+    /* 2. Rank into 10 bins */
+    proc rank data=temp_&var groups=10 out=bins_&var;
+        var &var._fix;
+        ranks bin_&var;
+    run;
+
+    /* 3. Bin-level distribution */
+    proc sql;
+        create table dist_&var as
+        select bin_&var,
+               sum(&target=1) as bad,
+               sum(&target=0) as good
+        from bins_&var
+        group by bin_&var;
+    quit;
+
+    /* 4. Laplace smoothing */
+    data dist2_&var;
+        set dist_&var;
+        bad_s = bad + 0.5;
+        good_s = good + 0.5;
+    run;
+
+    proc sql noprint;
+        select sum(bad_s), sum(good_s)
+        into :bad_tot, :good_tot
+        from dist2_&var;
+    quit;
+
+    /* 5. WOE */
+    data dist3_&var;
+        set dist2_&var;
+        bad_pct  = bad_s  / &bad_tot;
+        good_pct = good_s / &good_tot;
+        woe = log(bad_pct / good_pct);
+    run;
+
+    /* 6. Merge back */
+    proc sql;
+        create table &out as
+        select a.&id, a.&var, b.woe as woe_&var
+        from bins_&var a
+        left join dist3_&var b
+        on a.bin_&var = b.bin_&var;
+    quit;
+
+%mend;
+
+/* List of numeric predictors */
+%woe_num(data=lgd_base, var=ead,                out=woe_ead);
+%woe_num(data=lgd_base, var=collateral_value,   out=woe_collateral_value);
+%woe_num(data=lgd_base, var=recovery_amount,    out=woe_recovery_amount);
+%woe_num(data=lgd_base, var=recovery_cost,      out=woe_recovery_cost);
+%woe_num(data=lgd_base, var=time_to_recovery,   out=woe_time_to_recovery);
+
+proc sort data=lgd_base;                 by cust_id; run;
+proc sort data=woe_ead;                  by cust_id; run;
+proc sort data=woe_collateral_value;     by cust_id; run;
+proc sort data=woe_recovery_amount;      by cust_id; run;
+proc sort data=woe_recovery_cost;        by cust_id; run;
+proc sort data=woe_time_to_recovery;     by cust_id; run;
+
+data lgd_scorecard_woe_final;
+    merge
+        lgd_base
+        woe_ead
+        woe_collateral_value
+        woe_recovery_amount
+        woe_recovery_cost
+        woe_time_to_recovery;
+    by cust_id;
+run;
+
+proc logistic data=lgd_scorecard_woe_final descending;
+    model lgd_flag =
+        woe_ead
+        woe_collateral_value
+        woe_recovery_amount
+        woe_recovery_cost
+        woe_time_to_recovery
+    / selection=stepwise sls=0.05 sle=0.05;
+    output out=lgd_modelout p=pred_lgd;
+run;
+data lgd_final_scored;
+    set lgd_modelout;
+
+    if pred_lgd < 0.15 then lgd_band = 1;
+    else if pred_lgd < 0.35 then lgd_band = 2;
+    else if pred_lgd < 0.60 then lgd_band = 3;
+    else if pred_lgd < 0.80 then lgd_band = 4;
+    else lgd_band = 5;
+run;
+SAS example:
+/*-----------------------------------------------------------
+  1. Create PIT LGD from the scorecard model
+-----------------------------------------------------------*/
+data lgd_cal_raw;
+    set lgd_modelout;          /* Output from PROC LOGISTIC */
+
+    /* Map probability of high LGD to a continuous LGD (PIT) */
+    lgd_pit = pred_lgd * 0.80 + (1 - pred_lgd) * 0.25;
+    /* 0.25 = expected LGD for low-loss bucket
+       0.80 = expected LGD for high-loss bucket
+       These two anchors can be tuned to portfolio reality. */
+run;
+
+/*-----------------------------------------------------------
+  2. Assume a portfolio long-run average LGD (LRA LGD)
+     – for teaching / synthetic data
+-----------------------------------------------------------*/
+%let LRA_LGD = 0.45;   /* Example: 45% long-run average LGD */
+
+proc means data=lgd_cal_raw noprint;
+    var lgd_pit;
+    output out=mean_pit (drop=_TYPE_ _FREQ_) mean=mean_lgd_pit;
+run;
+
+data _null_;
+    set mean_pit;
+    call symputx('MEAN_LGD_PIT', mean_lgd_pit);
+run;
+data lgd_calibrated;
+    set lgd_cal_raw;
+    scaler   = &LRA_LGD. / &MEAN_LGD_PIT.;  /* portfolio-level scaler */
+    lgd_final = lgd_pit * scaler;           /* calibrated LGD (PIT aligned to LRA) */
+run;
+proc sql;
+    create table downturn_period as
+    select *
+    from macro_data
+    where unemployment_rate > p95 or recovery_rate < p5;
+quit;
+data lgd_downturn;
+    set lgd_calibrated;
+    if secured_flag=1 then downturn_uplift = 0.20;
+    else downturn_uplift = 0.35;
+
+    lgd_d = lgd_final * (1 + downturn_uplift);
+run;
+data lgd_ifrs9;
+    set lgd_downturn;
+    do t=1 to maturity_years;
+        pd_t = pd_year[t];
+        df_t = 1 / ((1 + discount_rate)**t);
+        lgd_t = lgd_d;
+        lgd_lifetime + (lgd_t * pd_t * df_t);
+    end;
+run;
+/* STEP 1: CREATE LIQUIDITY BANDS BASED ON COLLATERAL TYPE          */
+/* Business Rule: Vehicles = High                                   */
+/*                Property / PlantMachinery = Medium                */
+/*                Guarantee / Inventory / Receivables = Low         */
+/*********************************************************************/
+data credit.lgd_liquidity_scored;
+    set credit.LGD_SCORECARD_BASE;
+
+    length liquidity_band $20;
+    length liquidity_points 8;
+
+    /* Assign Band */
+    if collateral_type = "Vehicles" then liquidity_band = "High";
+
+    else if collateral_type in ("Property","PlantMachinery") 
+        then liquidity_band = "Medium";
+
+    else liquidity_band = "Low";   /* Guarantee, Inventory, Receivables */
+
+
+/*********************************************************************/
+/* STEP 2: ASSIGN SCORECARD POINTS                                  */
+/* These points directly drive the LGD score                         */
+/*********************************************************************/
+    select (liquidity_band);
+        when ("High")   liquidity_points = 40; /* Strong liquidity → low LGD */
+        when ("Medium") liquidity_points = 60; /* Balanced risk */
+        when ("Low")    liquidity_points = 85; /* Hard to liquidate → high LGD */
+        otherwise        liquidity_points = .; /* Data quality issue */
+    end;
+
+run;
+
+
+/*********************************************************************/
+/* STEP 3: SUMMARY CHECKS                                            */
+/* These checks verify correct scoring distribution                  */
+/*********************************************************************/
+proc freq data=credit.lgd_liquidity_scored;
+    tables liquidity_band;
+run;
+
+proc means data=credit.lgd_liquidity_scored n mean min max;
+    var liquidity_points;
+run;
+
+Step 3 — SAS Code (With Embedded Explanation)
+/*********************************************************************/
+/* STEP 1: CREATE ENFORCEMENT COMPLEXITY BANDS                      */
+/* Business Rule Summary:                                           */
+/*   - Low    = No legal action AND time_to_recovery ≤ 12 months    */
+/*   - Medium = Legal action AND time_to_recovery ≤ 24 months       */
+/*   - High   = Legal action + long delay (>24) OR high cost        */
+/*********************************************************************/
+data credit.lgd_enforcement_scored;
+    set credit.LGD_SCORECARD_BASE;
+
+    length enforce_band $20;
+    length enforce_points 8;
+
+    /* Assign complexity band */
+    if legal_action_flag = 0 and time_to_recovery <= 12 then enforce_band = "Low";
+
+    else if legal_action_flag = 1 
+         and time_to_recovery > 12 
+         and time_to_recovery <= 24 
+    then enforce_band = "Medium";
+
+    else enforce_band = "High"; /* long delays or costly litigation */
+
+/**************************************************************
+    * STEP 2: ASSIGN SCORECARD POINTS BASED ON ENFORCEMENT BAND *
+    **************************************************************/
+    select (enforce_band);
+        when ("Low")    enforce_points = 35; /* Best LGD outcome       */
+        when ("Medium") enforce_points = 55; /* Moderate enforcement   */
+        when ("High")   enforce_points = 95; /* Expensive, long delay  */
+        otherwise       enforce_points = .;  /* Data quality check     */
+    end;
+
+run;
+
+/*********************************************************************/
+/* STEP 3: SUMMARY CHECKS                                            */
+/* Ensures correct distribution of bands and scoring                  */
+/*********************************************************************/
+proc freq data=credit.lgd_enforcement_scored;
+    tables enforce_band;
+run;
+
+proc means data=credit.lgd_enforcement_scored n mean min max;
+    var enforce_points;
+run;
+
+Step 4 — SAS Code (with explanations inside)
+/*********************************************************************/
+/* STEP 1: CALCULATE HAIRCUT VALUE AND COVERAGE RATIO               */
+/* Haircut = 25% forced-sale discount (industry standard)            */
+/*********************************************************************/
+data credit.lgd_coverage_scored;
+    set credit.LGD_SCORECARD_BASE;
+
+    haircut_value   = collateral_value * 0.75;
+    coverage_ratio  = haircut_value / ead;
+
+    length coverage_band $20;
+    length coverage_points 8;
+
+    /*****************************************************************
+    * STEP 2: ASSIGN COVERAGE BAND BASED ON COVERAGE_RATIO          *
+    *****************************************************************/
+    if coverage_ratio >= 1.20 then coverage_band = "Strong";
+    else if 0.80 <= coverage_ratio < 1.20 then coverage_band = "Moderate";
+    else coverage_band = "Weak";
+
+    /*****************************************************************
+    * STEP 3: ASSIGN SCORECARD POINTS (LGD RISK SCALE 30–95)        *
+    *****************************************************************/
+    select (coverage_band);
+        when ("Strong")   coverage_points = 30;  /* Lowest LGD risk     */
+        when ("Moderate") coverage_points = 60;  /* Medium LGD exposure */
+        when ("Weak")     coverage_points = 95;  /* High LGD risk       */
+        otherwise          coverage_points = .;  /* Data error          */
+    end;
+
+run;
+
+/*********************************************************************/
+/* STEP 4: SUMMARY CHECK (VALIDATION FOR DOCUMENTATION)        */
+/*********************************************************************/
+proc freq data=credit.lgd_coverage_scored;
+    tables coverage_band;
+run;
+
+proc means data=credit.lgd_coverage_scored n mean min max;
+    var coverage_points;
+run;
+libname credit "/our/path/credit";
+
+proc contents data=credit.EAD_SCORECARD_BASE varnum;
+run;
+
+proc print data=credit.EAD_SCORECARD_BASE (obs=20);
+run;
+proc means data=credit.EAD_SCORECARD_BASE 
+     n mean min p25 p50 p75 max;
+    var limit_amt current_balance undrawn_amt
+        util_ratio undrawn_ratio obs_ccf ead_current ead_at_default;
+run;
+proc freq data=credit.EAD_SCORECARD_BASE;
+    tables dpd_12m_max dpd_ever_30plus high_risk_flag obs_ccf_high_flag;
+run;
+proc means data=credit.EAD_SCORECARD_BASE n mean;
+    class facility_type;
+    var util_ratio obs_ccf undrawn_ratio;
+run;
+data work.EAD_DEV;
+    set credit.EAD_SCORECARD_BASE;
+    ead_flag = obs_ccf_high_flag;
+run;
+data work.EAD_DEV;
+    set credit.EAD_SCORECARD_BASE;
+
+    /* Target for EAD scorecard */
+    ead_flag = obs_ccf_high_flag;
+
+    /* Transformations */
+    ln_limit_amt   = log(limit_amt+1);
+    ln_undrawn_amt = log(undrawn_amt+1);
+    ln_curr_bal    = log(current_balance+1);
+
+    util_delta_6m  = util_ratio - util_ratio_6m_ago;
+    util_delta_12m = util_ratio - util_ratio_12m_ago;
+
+    dpd_60plus_flag = (dpd_12m_max >= 60);
+
+    high_risk_dpd_combo = (high_risk_flag=1 and dpd_ever_30plus=1);
+run;
+
+4.5 Step 3 — Train/Validation Split
+proc sort data=work.EAD_DEV;
+    by ead_flag;
+run;
+
+proc surveyselect data=work.EAD_DEV 
+    method=srs
+    samprate=0.7
+    seed=2025
+    out=work.EAD_SPLIT
+    outall;
+    strata ead_flag;
+run;
+data work.EAD_TRAIN work.EAD_VALID;
+    set work.EAD_SPLIT;
+    if Selected = 1 then output work.EAD_TRAIN;
+    else output work.EAD_VALID;
+run;
+proc rank data=work.EAD_TRAIN groups=10 out=work.EAD_TRAIN_BIN;
+    var util_ratio util_vol_12m util_change_12m undrawn_ratio ln_limit_amt;
+    ranks r_util r_vol r_change r_undrawn r_limit;
+run;
+    proc sql;
+        create table &out as
+        select &var,
+               sum(&target) as bad,
+               count(*) as total,
+               (count(*) - sum(&target)) as good
+        from &in
+        group by &var;
+    quit;
+
+    data &out;
+        set &out;
+        total_bad = sum(bad);
+        total_good = sum(good);
+    run;
+
+    data &out;
+        set &out;
+        dist_good = good / total_good;
+        dist_bad  = bad / total_bad;
+
+        if dist_good>0 and dist_bad>0 then WOE = log(dist_good/dist_bad);
+        else WOE = 0;
+    run;
+
+%mend;
+%woe(in=work.EAD_TRAIN_BIN, var=r_util, target=ead_flag, out=woe_util);
+%woe(in=work.EAD_TRAIN_BIN, var=r_vol, target=ead_flag, out=woe_vol);
+%woe(in=work.EAD_TRAIN_BIN, var=r_change, target=ead_flag, out=woe_change);
+%woe(in=work.EAD_TRAIN_BIN, var=r_undrawn, target=ead_flag, out=woe_undrawn);
+%woe(in=work.EAD_TRAIN_BIN, var=r_limit, target=ead_flag, out=woe_limit);
+
+%woe(in=work.EAD_TRAIN, var=dpd_12m_max, target=ead_flag, out=woe_dpd);
+%woe(in=work.EAD_TRAIN, var=facility_type, target=ead_flag, out=woe_facility);
+
+%macro iv_calc(data=, var=, target=);
+
+    proc sql;
+        create table tmp as
+        select &var as bucket,
+               sum(&target) as bad,
+               count(*) as total,
+               (count(*) - sum(&target)) as good
+        from &data
+        group by &var;
+    quit;
+
+    data tmp2;
+        set tmp end=eof;
+
+        retain total_bad total_good 0;
+
+        if _n_ = 1 then do;
+            total_bad = 0;
+            total_good = 0;
+        end;
+
+        total_bad + bad;
+        total_good + good;
+
+        if eof then call symput('tb', total_bad);
+        if eof then call symput('tg', total_good);
+    run;
+
+    data iv_&var.;
+        set tmp2;
+
+        dist_bad = bad / &tb;
+        dist_good = good / &tg;
+
+        if dist_bad>0 and dist_good>0 then WOE = log(dist_good/dist_bad);
+        else WOE=0;
+
+        IV = (dist_good - dist_bad) * WOE;
+    run;
+
+%mend;
+
+Apply to key variables
+%iv_calc(data=work.EAD_TRAIN, var=dpd_12m_max, target=ead_flag);
+%iv_calc(data=work.EAD_TRAIN, var=facility_type, target=ead_flag);
+%iv_calc(data=work.EAD_TRAIN, var=high_risk_flag, target=ead_flag);
+%iv_calc(data=work.EAD_TRAIN, var=high_util_flag, target=ead_flag);
+%iv_calc(data=work.EAD_TRAIN, var=ccf_gap, target=ead_flag);
+%iv_calc(data=work.EAD_TRAIN, var=util_delta_6m, target=ead_flag);
+%iv_calc(data=work.EAD_TRAIN, var=util_vol_12m, target=ead_flag);
+
+proc print data=iv_dpd_12m_max noobs;
+    var bucket bad good dist_good dist_bad woe iv;
+run;
+proc sql;
+    select memname into :ivlist separated by ' '
+    from dictionary.tables
+    where libname='WORK' and memname like 'IV_%';
+quit;
+
+/* Step 2: Loop through each IV dataset and extract total IV */
+data iv_summary_final;
+    length variable $50 IV 8.;
+    stop;
+run;
+
+%macro collect_iv;
+    %local count i ds;
+
+    %let count=%sysfunc(countw(&ivlist));
+
+    %do i=1 %to &count;
+        %let ds=%scan(&ivlist, &i);
+
+        /* Compute total IV = sum of IV column */
+        proc sql noprint;
+            select sum(IV) into :iv_total
+            from &ds;
+        quit;
+
+        data temp;
+            length variable $50 IV 8.;
+            variable = "%substr(&ds,4)"; /* remove 'iv_' prefix */
+            IV = &iv_total;
+        run;
+
+        proc append base=iv_summary_final data=temp force;
+        run;
+
+    %end;
+%mend;
+
+%collect_iv;
+
+proc print data=iv_summary_final label noobs;
+    var variable IV;
+    label variable = "Variable"
+          IV       = "Information Value";
+run;
+proc corr data=work.EAD_DEV nosimple plots=matrix(histogram);
+    var util_ratio 
+        util_ratio_6m_ago util_ratio_12m_ago 
+        util_min_12m util_max_12m util_vol_12m 
+        undrawn_amt undrawn_ratio 
+        dpd_12m_max dpd_ever_30plus
+        high_risk_flag high_risk_dpd_flag;
+run;
+SAS Code
+/*=============================================================
+  0. Create DEV dataset with all 6 scorecard targets
+  Source: CREDIT.EAD_SCORECARD_BASE  (15,000 obs)
+===============================================================*/
+
+data EAD_DEV;
+    set credit.EAD_SCORECARD_BASE;
+
+    /* TARGET 1: CCF High Drawdown Scorecard */
+    ccf_flag = obs_ccf_high_flag;
+
+    /* TARGET 2: EAD High Scorecard (>= 90% limit usage at default) */
+    ead_high_flag = (ead_at_default / limit_amt > 0.9);
+
+    /* TARGET 3A: EAD 50% Band Scorecard */
+    ead50_flag = (ead_at_default / limit_amt > 0.5);
+
+    /* TARGET 3B: EAD 80% Band Scorecard */
+    ead80_flag = (ead_at_default / limit_amt > 0.8);
+
+    /* TARGET 4: Limit Misalignment Scorecard  
+       – High undrawn limit, but no DPD + no high-risk DPD flag */
+    limit_misaligned_flag =
+        (undrawn_ratio > 0.8 and dpd_12m_max = 0 and high_risk_dpd_flag = 0);
+
+    /* TARGET 5: Early Warning EAD Scorecard
+       – High utilisation plus DPD, OR high-risk DPD flag */
+    ew_flag =
+        (util_ratio > 0.7 and dpd_12m_max >= 30)
+        or (high_risk_dpd_flag = 1);
+run;
+
+/*=============================================================
+  1. Train / Validation Split (single split, reused for all models)
+===============================================================*/
+
+/* Sort by main target used for stratification (CCF) */
+proc sort data=EAD_DEV;
+    by ccf_flag;
+run;
+
+proc surveyselect data=EAD_DEV
+    method = srs
+    samprate = 0.7
+    seed = 2025
+    out = EAD_SPLIT
+    outall;
+    strata ccf_flag;
+run;
+
+data EAD_TRAIN EAD_VALID;
+    set EAD_SPLIT;
+    if Selected = 1 then output EAD_TRAIN;
+    else                output EAD_VALID;
+run;
+
+/*=============================================================
+  2. Binning (Deciles) for 8 Core Drivers – TRAIN only
+     Drivers (example 8):
+     util_ratio, util_ratio_6m_ago, util_ratio_12m_ago,
+     util_min_12m, util_max_12m, util_vol_12m,
+     undrawn_ratio, dpd_12m_max
+===============================================================*/
+
+proc rank data=EAD_TRAIN groups=10 out=EAD_BIN;
+    var
+        util_ratio
+        util_ratio_6m_ago
+        util_ratio_12m_ago
+        util_min_12m
+        util_max_12m
+        util_vol_12m
+        undrawn_ratio
+        dpd_12m_max
+    ;
+    ranks
+        b_util
+        b_util6
+        b_util12
+        b_utmin
+        b_utmax
+        b_utvol
+        b_undrawn
+        b_dpdmax
+    ;
+run;
+
+/*=============================================================
+  3. Generic WOE + IV Macro (correct total-based distributions)
+===============================================================*/
+
+%macro woe(in=, binvar=, target=, out=);
+
+    /* Aggregate bad/good per bin */
+    proc sql;
+        create table _agg_ as
+        select  &binvar          as &binvar,
+                sum(&target)     as bad,
+                count(*) - sum(&target) as good,
+                count(*)         as total
+        from &in
+        group by &binvar;
+    quit;
+
+    /* Get total bad and good over all bins */
+    proc sql noprint;
+        select sum(bad), sum(good)
+        into :tot_bad, :tot_good
+        from _agg_;
+    quit;
+
+    %let tot_bad   = &tot_bad;
+    %let tot_good  = &tot_good;
+
+    /* Compute dist_good, dist_bad, WOE, IV */
+    data &out;
+        set _agg_;
+        dist_bad  = bad  / &tot_bad;
+        dist_good = good / &tot_good;
+
+        if dist_good > 0 and dist_bad > 0 then WOE = log(dist_good / dist_bad);
+        else WOE = 0;
+
+        IV = (dist_good - dist_bad) * WOE;
+    run;
+
+    proc datasets lib=work nolist;
+        delete _agg_;
+    quit;
+
+%mend;
+
+/*=============================================================
+  4. WOE Tables for CCF Scorecard (target = ccf_flag)
+     – 8 Drivers → 8 WOE tables
+===============================================================*/
+
+%woe(in=EAD_BIN, binvar=b_util,    target=ccf_flag, out=woe_util);
+%woe(in=EAD_BIN, binvar=b_util6,   target=ccf_flag, out=woe_util6);
+%woe(in=EAD_BIN, binvar=b_util12,  target=ccf_flag, out=woe_util12);
+%woe(in=EAD_BIN, binvar=b_utmin,   target=ccf_flag, out=woe_utmin);
+%woe(in=EAD_BIN, binvar=b_utmax,   target=ccf_flag, out=woe_utmax);
+%woe(in=EAD_BIN, binvar=b_utvol,   target=ccf_flag, out=woe_utvol);
+%woe(in=EAD_BIN, binvar=b_undrawn, target=ccf_flag, out=woe_undrawn);
+%woe(in=EAD_BIN, binvar=b_dpdmax,  target=ccf_flag, out=woe_dpdmax);
+
+/*=============================================================
+  5. Build WOE-Modelling Base
+     – Join bins with corresponding WOE values for each driver
+===============================================================*/
+
+proc sql;
+    create table MODEL_BASE as
+    select  a.*,
+            u.WOE   as woe_util,
+            u6.WOE  as woe_util6,
+            u12.WOE as woe_util12,
+            mn.WOE  as woe_utmin,
+            mx.WOE  as woe_utmax,
+            v.WOE   as woe_utvol,
+            un.WOE  as woe_undrawn,
+            d.WOE   as woe_dpdmax
+    from EAD_BIN as a
+        left join woe_util    as u   on a.b_util    = u.b_util
+        left join woe_util6   as u6  on a.b_util6   = u6.b_util6
+        left join woe_util12  as u12 on a.b_util12  = u12.b_util12
+        left join woe_utmin   as mn  on a.b_utmin   = mn.b_utmin
+        left join woe_utmax   as mx  on a.b_utmax   = mx.b_utmax
+        left join woe_utvol   as v   on a.b_utvol   = v.b_utvol
+        left join woe_undrawn as un  on a.b_undrawn = un.b_undrawn
+        left join woe_dpdmax  as d   on a.b_dpdmax  = d.b_dpdmax
+    ;
+quit;
+
+/* Optional sanity check */
+proc contents data=MODEL_BASE; run;
+
+/*=============================================================
+  6. Scorecard Builder Macro
+     – Reuses the same WOE drivers for different targets
+===============================================================*/
+
+%macro build_scorecard(target=, scorevar=, out=);
+
+    /* Logistic model on TRAIN (MODEL_BASE is from TRAIN only) */
+    proc logistic data=MODEL_BASE descending;
+        model &target =
+            woe_util
+            woe_util6
+            woe_util12
+            woe_utmin
+            woe_utmax
+            woe_utvol
+            woe_undrawn
+            woe_dpdmax
+        ;
+        output out=&out p=&scorevar;
+    run;
+
+    /* Translate probability into 0–1000 score */
+    data &out;
+        set &out;
+        score = round(&scorevar * 1000);
+    run;
+
+    /* KS / separation check on TRAIN */
+    proc npar1way data=&out edf;
+        class &target;
+        var score;
+    run;
+
+%mend;
+
+/*=============================================================
+  7. Build All 6 EAD/CCF Scorecards
+===============================================================*/
+
+/* 1) CCF High Drawdown Scorecard */
+%build_scorecard(target=ccf_flag,             scorevar=prob_ccf,   out=sc_ccf);
+
+/* 2) EAD High Scorecard (>= 90%) */
+%build_scorecard(target=ead_high_flag,        scorevar=prob_eadh,  out=sc_eadhigh);
+
+/* 3) EAD 50% Band Scorecard */
+%build_scorecard(target=ead50_flag,           scorevar=prob_ead50, out=sc_ead50);
+
+/* 4) Limit Misalignment Scorecard */
+%build_scorecard(target=limit_misaligned_flag,scorevar=prob_lm,    out=sc_limit);
+
+/* 5) Early Warning EAD Scorecard */
+%build_scorecard(target=ew_flag,              scorevar=prob_ew,    out=sc_earlywarning);
+
+
+1. SAS Code — PROC MEANS & PROC FREQ for All Scorecards
+
+
+proc means data=sc_ccf n mean std min p25 median p75 max;
+    var score prob_ccf
+        util_ratio util_change_12m util_vol_12m undrawn_ratio 
+        dpd_12m_max ead_current 
+        ccf_baseline ccf_pit ccf_ttc ccf_gap;
+run;
+
+title "CCF Scorecard — FREQ Summary (with Score Bands)";
+/* Create score bands for interpretation */
+title "CCF Scorecard — FREQ Summary (with Score Bands)";
+
+proc format;
+    value scoreband
+        0 -< 200 = '0–200 Very Low Score'
+        200 -< 350 = '200–350 Moderate'
+        350 -< 500 = '350–500 High'
+        500 - high = '500+ Very High Risk';
+run;
+
+proc freq data=sc_ccf;
+    tables 
+        segment*score
+        facility_type*score
+        high_risk_flag*score
+        high_risk_dpd_flag*score
+        dpd_ever_30plus*score
+        ;
+    format score scoreband.;
+run;
+
+title;
+
+EAD High Scorecard — PROC MEANS + PROC FREQ Code 
+/* ------------------------------------------------------------------
+   EAD HIGH SCORECARD — DISTRIBUTION (MEANS + FREQ)
+------------------------------------------------------------------ */
+
+data sc_eadhigh;
+    set sc_eadhigh;
+    if      score <200 then scoreband='0–200 Very Low Score';
+    else if score <350 then scoreband='200–350 Moderate';
+    else if score <500 then scoreband='350–500 High';
+    else                    scoreband='500+ Very High Risk';
+run;
+
+proc means data=sc_eadhigh n mean std min p25 median p75 max;
+    var 
+        score prob_eadh
+        util_ratio util_change_12m util_vol_12m undrawn_ratio
+        dpd_12m_max ead_current
+        ccf_baseline ccf_pit ccf_ttc ccf_gap;
+run;
+/* 2. DEFINE SCORE BANDS */
+title "EAD High Scorecard — FREQ Summary (with Score Bands)";
+
+proc format;
+    value scoreband
+        0 -< 200   = '0–200 Very Low Score'
+        200 -< 350 = '200–350 Moderate'
+        350 -< 500 = '350–500 High'
+        500 - high = '500+ Very High Risk';
+run;
+
+/* 3. FULL FREQ MIX ACROSS SEGMENTS, FACILITY, RISK FLAGS */
+proc freq data=sc_eadhigh;
+    tables
+        segment*scoreband
+        facility_type*scoreband
+        high_risk_flag*scoreband
+        high_risk_dpd_flag*scoreband
+        dpd_ever_30plus*scoreband
+        ;
+    format score scoreband.;
+run;
+
+title;
+EAD50 Scorecard Code
+/* 1. SUMMARY STATISTICS (MEANS) */
+proc means data=sc_ead50 n mean std min p25 median p75 max;
+    var 
+        score prob_ead50
+        util_ratio util_change_12m util_vol_12m undrawn_ratio
+        dpd_12m_max ead_current
+        ccf_baseline ccf_pit ccf_ttc ccf_gap;
+run;
+
+
+/* 2A. CREATE SCOREBAND VARIABLE */
+data sc_ead50_bands;
+    set sc_ead50;
+    length scoreband $40;
+    if 0 <= score < 200 then scoreband = '0–200 Very Low Score';
+    else if 200 <= score < 350 then scoreband = '200–350 Moderate Score';
+    else if 350 <= score < 500 then scoreband = '350–500 High Score';
+    else if score >= 500 then scoreband = '500+ Very High Risk';
+run;
+
+/* 3. FREQ TABLES */
+proc freq data=sc_ead50_bands;
+    tables
+        segment*scoreband
+        facility_type*scoreband
+        high_risk_flag*scoreband
+        high_risk_dpd_flag*scoreband
+        dpd_ever_30plus*scoreband;
+run;
+(A) SAS CODE — LIMIT SCORECARD (limit_flag / limit_bucket)
+/*===========================================================
+   LIMIT SCORECARD — MEANS + FREQ WITH SCORE BANDS
+===========================================================*/
+
+/* 1. SUMMARY STATISTICS */
+proc means data=sc_limit n mean std min p25 median p75 max;
+    var 
+        score prob_lm
+        util_ratio util_change_12m util_vol_12m undrawn_ratio
+        dpd_12m_max ead_current
+        ccf_baseline ccf_pit ccf_ttc ccf_gap;
+run;
+
+/*-----------------------------------------------------------
+   2. DEFINE SCORE BANDS
+-----------------------------------------------------------*/
+proc format;
+    value scoreband
+        0 -< 200   = '0–200 Very Low Score'
+        200 -< 350 = '200–350 Moderate Score'
+        350 -< 500 = '350–500 High Score'
+        500 - high = '500+ Very High Risk';
+run;
+
+/*-----------------------------------------------------------
+   3. FREQUENCY TABLES WITH SCORE BANDS
+   (using FORMAT — NOT a variable)
+-----------------------------------------------------------*/
+title "Limit Scorecard — FREQ Summary (with Score Bands)";
+
+proc freq data=sc_limit;
+    format score scoreband.;   /* Apply scoreband */
+    tables
+        segment*score
+        facility_type*score
+        high_risk_flag*score
+        high_risk_dpd_flag*score
+        dpd_ever_30plus*score
+        limit_bucket*score
+        ;
+run;
+
+title;
+SAS Code
+
+/****************************************************************************************
+* EAD SCORECARD 4 — LIMIT MANAGEMENT & OVER-LIMIT RISK
+****************************************************************************************/
+
+data credit.ead_limit_scored;
+    set credit.EAD_SCORECARD_BASE;
+
+    length limit_band   $30;
+    length limit_points 8;
+
+    /*****************************************************************
+    STEP 1: LIMIT MISALIGNMENT LOGIC
+    *****************************************************************/
+
+    /* VERY HIGH RISK */
+    if util_ratio > 0.85
+       and dpd_12m_max >= 30
+       and undrawn_ratio < 0.15 then
+        limit_band = "Very High Limit Risk";
+
+    /* HIGH RISK */
+    else if util_ratio > 0.75
+         and (util_vol_12m > 0.15 or util_change_12m > 0.10) then
+        limit_band = "High Limit Risk";
+
+    /* MODERATE RISK  */
+    else if (util_ratio >= 0.50 and util_ratio <= 0.75)
+         or (undrawn_ratio >= 0.20 and undrawn_ratio <= 0.40) then
+        limit_band = "Moderate Limit Risk";
+
+    /* LOW RISK */
+    else
+        limit_band = "Low Limit Risk";
+
+
+/*****************************************************************
+    STEP 2: ASSIGN LIMIT SCORECARD POINTS
+    *****************************************************************/
+
+    if      limit_band = "Low Limit Risk"        then limit_points = 35;
+    else if limit_band = "Moderate Limit Risk"   then limit_points = 55;
+    else if limit_band = "High Limit Risk"       then limit_points = 75;
+    else if limit_band = "Very High Limit Risk"  then limit_points = 95;
+    else limit_points = .;
+
+run;
+
+
+/*****************************************************************
+STEP 3: FREQUENCY + SCORE VALIDATION
+*****************************************************************/
+
+proc freq data=credit.ead_limit_scored;
+    tables limit_band;
+run;
+
+proc means data=credit.ead_limit_scored n mean min max;
+    var limit_points;
+run;
+
+/*===========================================================
+   EARLY WARNING SCORECARD — CREATE SCOREBAND VARIABLE
+===========================================================*/
+
+data sc_ew2; 
+    set work.sc_earlywarning;
+
+    length scoreband $40;
+
+    if 0 <= score < 200 then scoreband = '0–200 Very Low Score';
+    else if 200 <= score < 350 then scoreband = '200–350 Moderate Score';
+    else if 350 <= score < 500 then scoreband = '350–500 High Score';
+    else if score >= 500 then scoreband = '500+ Very High Risk';
+    else scoreband = 'Missing Score';
+run;
+
+
+/*===========================================================
+   SUMMARY STATISTICS (MEANS)
+===========================================================*/
+
+proc means data=sc_ew2 n mean std min p25 median p75 max;
+    var
+        score prob_ew
+        util_ratio util_change_12m util_vol_12m undrawn_ratio
+        dpd_12m_max ead_current
+        ccf_baseline ccf_pit ccf_ttc ccf_gap;
+run;
+
+
+/*===========================================================
+   FREQUENCY TABLES BY SCOREBAND
+===========================================================*/
+
+title "Early Warning Scorecard — FREQ Summary (with Score Bands)";
+
+proc freq data=sc_ew2;
+    tables
+        segment*scoreband
+        facility_type*scoreband
+        high_risk_flag*scoreband
+        high_risk_dpd_flag*scoreband
+        dpd_ever_30plus*scoreband
+        ew_flag*scoreband
+        / missing;
+run;
+
+title;
+
+/*---------------------------------------------------------------*
+ |  STEP 0 – CLEANUP / PREP
+ *---------------------------------------------------------------*/
+
+options validvarname=any;
+options nosyntaxcheck;
+options obs=max;
+
+/* Shorten long variable names in Transition table */
+data CREDIT.CLIMATE_TRANSITION_TABLE_CLEAN;
+    set CREDIT.CLIMATE_TRANSITION_TABLE;
+
+    rename
+        transition_combined_index_100  = tci100
+        transition_combined_score_1000 = tcs1000
+        transition_index_100           = ti100
+        emissions_index_100            = ei100
+        transition_score_1000          = ts1000;
+run;
+
+/*---------------------------------------------------------------*
+ |  STEP 1 – PHYSICAL HAZARD INDICES
+ *---------------------------------------------------------------*/
+
+data CREDIT.PHYSICAL_HAZARD_STAGE1;
+    set CREDIT.CLIMATE_SCORECARD_BASE;
+
+    flood_index        = min(100, (flood_depth_cm / 200) * 100);
+    heat_index         = min(100, (heatwave_days_raw / 90) * 100);
+    drought_index      = min(100, (drought_index_raw / 5) * 100);
+    storm_index        = min(100, ((storm_speed_raw - 20) / 160) * 100);
+    sealevel_index     = min(100, (sea_level_rise_cm_raw / 60) * 100);
+    carbon_index       = min(100, (carbon_intensity_raw / 1200) * 100);
+    energyshock_index  = min(100, (energy_price_shock_raw / 30) * 100);
+    ndvi_vulnerability = (1 - ndvi_raw) * 100;
+run;
+
+/*---------------------------------------------------------------*
+ |  STEP 2 – TRANSITION RISK INDICES
+ *---------------------------------------------------------------*/
+
+data CREDIT.TRANSITION_STAGE2;
+    set CREDIT.CLIMATE_TRANSITION_TABLE_CLEAN;
+
+    /* Raw → scaled */
+    transition_risk_idx        = transition_risk_raw * 10;
+    emissions_intensity_idx    = min(100, (emissions_intensity_raw / 1500) * 100);
+
+    /* Short names: already normalised 0–100 indices */
+    trans_idx_100              = ti100;
+    emiss_idx_100              = ei100;
+    tci100_fx                  = tci100;
+
+    /* Composite Transition Input (5-point average) */
+    TCCI_input = mean(
+        transition_risk_idx,
+        emissions_intensity_idx,
+        ti100,
+        ei100,
+        tci100
+    );
+run;
+
+/*---------------------------------------------------------------*
+ |  STEP 3 – VULNERABILITY INDICES
+ *---------------------------------------------------------------*/
+
+data CREDIT.VULNERABILITY_STAGE3;
+    set CREDIT.CLIMATE_VULNERABILITY_TABLE;
+
+    vuln_index_from_raw     = (vulnerability_raw / 10) * 100;
+    vuln_index_existing     = vulnerability_index_100;
+
+    exposure_index_from_raw = (exposure_raw / 10) * 100;
+    exposure_index_existing = exposure_index_100;
+
+    /* Composite Vulnerability Index */
+    VULNCI = mean(
+        vuln_index_from_raw,
+        vuln_index_existing,
+        exposure_index_from_raw,
+        exposure_index_existing
+    );
+run;
+
+/*---------------------------------------------------------------*
+ |  STEP 4 – READINESS (RISK-ORIENTED)
+ *---------------------------------------------------------------*/
+
+data CREDIT.READINESS_STAGE4;
+    set CREDIT.CLIMATE_READINESS_TABLE;
+
+    policy_risk_index         = (1 - climate_policy_score_raw      / 10) * 100;
+    disclosure_risk_index     = (1 - disclosure_quality_raw        / 10) * 100;
+    greeninv_risk_index       = (1 - green_investment_ratio_raw         ) * 100;
+    renewable_readiness_index = (1 - renewable_energy_share_raw   / 100) * 100;
+    governance_risk_index     = (1 - climate_governance_score_raw / 10) * 100;
+    datareadiness_risk_index  = (1 - data_system_readiness_raw    / 10) * 100;
+
+    scenario_alignment_risk_index = scenario_alignment_gap_pct_raw;
+run;
+
+/*---------------------------------------------------------------*
+ |  STEP 5 – RESILIENCE (RISK-ORIENTED)
+ *---------------------------------------------------------------*/
+
+data CREDIT.RESILIENCE_STAGE5;
+    set CREDIT.CLIMATE_RESILIENCE_TABLE;
+
+    infra_resilience_risk_index   = (1 - infra_resilience_raw          / 10) * 100;
+    buffer_risk_index             = (1 - financial_buffer_months_raw   / 12) * 100;
+    insurance_risk_index          = (1 - insurance_coverage_pct_raw    / 100) * 100;
+    bcp_risk_index                = (1 - bc_plan_maturity_raw          / 10) * 100;
+    emergency_risk_index          = (1 - emergency_response_rating_raw / 10) * 100;
+    digital_risk_index            = (1 - digital_resilience_score_raw  / 10) * 100;
+    supplychain_risk_index        = (1 - supply_chain_diversification_raw / 10) * 100;
+run;
+
+/*---------------------------------------------------------------*
+ |  STEP 6 – PORTFOLIO-LEVEL INDICES
+ *---------------------------------------------------------------*/
+
+data CREDIT.PORTFOLIO_STAGE6;
+    set CREDIT.CLIMATE_PORTFOLIO_TABLE;
+
+    exposure_risk_index       = min(100, (exposure_ead_mn_raw / 1000) * 100);
+    portpd_risk_index         = baseline_pd_pct_raw;
+    highrisk_asset_index      = high_risk_share_pct_raw;
+
+    green_exposure_risk_index = (1 - green_exposure_pct_raw / 100) * 100;
+
+    sector_conc_risk_index    = top3_sector_concentration_pct_ra;
+
+    highrisk_obligor_index    = min(100, (climate_high_risk_obligors_count / 500) * 100);
+
+    stressloss_risk_index     = climate_stress_loss_pct_raw;
+run;
+
+/*---------------------------------------------------------------*
+ |  STEP 7 – COMBINED CLIMATE SCORE TABLE
+ *---------------------------------------------------------------*/
+
+proc sql;
+    create table CREDIT.CLIMATE_COMBINED_SCORE_TABLE as
+    select
+        a.*,
+        /* Transition */
+        b.transition_risk_idx,
+        b.emissions_intensity_idx,
+        b.trans_idx_100,
+        b.emiss_idx_100,
+        b.tci100_fx,
+        b.TCCI_input,
+
+        /* Vulnerability */
+        c.vuln_index_from_raw,
+        c.vuln_index_existing,
+        c.exposure_index_from_raw,
+        c.exposure_index_existing,
+        c.VULNCI,
+
+        /* Readiness */
+        d.policy_risk_index,
+        d.disclosure_risk_index,
+        d.greeninv_risk_index,
+        d.renewable_readiness_index,
+        d.governance_risk_index,
+        d.datareadiness_risk_index,
+        d.scenario_alignment_risk_index,
+
+        /* Resilience */
+        e.infra_resilience_risk_index,
+        e.buffer_risk_index,
+        e.insurance_risk_index,
+        e.bcp_risk_index,
+        e.emergency_risk_index,
+        e.digital_risk_index,
+        e.supplychain_risk_index,
+
+        /* Portfolio */
+        f.portfolio_id,
+        f.segment,
+        f.product_type,
+        f.exposure_risk_index,
+        f.portpd_risk_index,
+        f.highrisk_asset_index,
+        f.green_exposure_risk_index,
+        f.sector_conc_risk_index,
+        f.highrisk_obligor_index,
+        f.stressloss_risk_index
+
+    from CREDIT.PHYSICAL_HAZARD_STAGE1 a
+        left join CREDIT.TRANSITION_STAGE2    b on a.cust_id = b.cust_id
+        left join CREDIT.VULNERABILITY_STAGE3 c on a.cust_id = c.cust_id
+        left join CREDIT.READINESS_STAGE4     d on a.cust_id = d.cust_id
+        left join CREDIT.RESILIENCE_STAGE5    e on a.cust_id = e.cust_id
+        left join CREDIT.PORTFOLIO_STAGE6     f on 1 = 1
+    ;
+quit;
+
+/*---------------------------------------------------------------*
+ |  STEP 7B – COMPOSITE INDICES
+ *---------------------------------------------------------------*/
+
+data CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+    set CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+
+    PCCI = mean(of flood_index heat_index drought_index storm_index
+                sealevel_index carbon_index energyshock_index ndvi_vulnerability);
+
+    TCCI = TCCI_input;
+
+    RCI = mean(of policy_risk_index disclosure_risk_index greeninv_risk_index
+               renewable_readiness_index governance_risk_index
+               datareadiness_risk_index scenario_alignment_risk_index);
+
+    RSI = mean(of infra_resilience_risk_index buffer_risk_index insurance_risk_index
+               bcp_risk_index emergency_risk_index digital_risk_index
+               supplychain_risk_index);
+
+    PCI = mean(of exposure_risk_index portpd_risk_index highrisk_asset_index
+               green_exposure_risk_index sector_conc_risk_index
+               highrisk_obligor_index stressloss_risk_index);
+
+    MCRI = 0.2 * (PCCI + TCCI + RCI + RSI + PCI);
+run;
+
+/*---------------------------------------------------------------*
+ |  STEP 8 – CLIMATE SCORE HEALTH REPORT
+ *---------------------------------------------------------------*/
+
+proc means data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE noprint;
+    class segment;
+    var PCCI TCCI RCI RSI PCI;
+    output out=CREDIT.CLIMATE_SCORE_HEALTH_REPORT_RAW
+        mean(PCCI)=mean_pcci
+        mean(TCCI)=mean_tcci
+        mean(RCI)=mean_rci
+        mean(RSI)=mean_rsi
+        mean(PCI)=mean_pci
+        std(PCCI TCCI RCI RSI PCI)=std_pcci std_tcci std_rci std_rsi std_pci;
+run;
+
+data CREDIT.CLIMATE_SCORE_HEALTH_REPORT;
+    set CREDIT.CLIMATE_SCORE_HEALTH_REPORT_RAW;
+    where _TYPE_ ne .;
+
+    PCHI = 100 - mean_pcci;
+    TCHI = 100 - mean_tcci;
+    RHI  = 100 - mean_rci;
+    ReHI = 100 - mean_rsi;
+    PHI  = 100 - mean_pci;
+
+    MCSI = mean(of PCHI TCHI RHI ReHI PHI);
+
+    CVI = mean(of std_pcci std_tcci std_rci std_rsi std_pci);
+
+    CTI = 50;
+    CRFI = 0;
+
+    CHS = 0.4 * MCSI + 0.2 * CTI + 0.2 * (100 - CVI) + 0.2 * CRFI;
+
+    drop _TYPE_ _FREQ_;
+run;
+6.2.5 — SAS Code
+data CREDIT.SCORE_FLOOD;
+    set CREDIT.CLIMATE_SCORECARD_BASE;
+
+    flood_index = min(100,(flood_depth_cm/200)*100);
+
+    length flood_band $2.;
+    if flood_index<=20 then do; flood_band="VL"; flood_score=50; end;
+    else if flood_index<=40 then do; flood_band="L"; flood_score=100; end;
+    else if flood_index<=60 then do; flood_band="M"; flood_score=200; end;
+    else if flood_index<=80 then do; flood_band="H"; flood_score=300; end;
+    else do; flood_band="C"; flood_score=400; end;
+run;
+6.3.5 — SAS Code
+data CREDIT.SCORE_HEATWAVE;
+    set CREDIT.CLIMATE_SCORECARD_BASE;
+
+    heat_index = min(100,(heatwave_days_raw/90)*100);
+
+    length heat_band $2.;
+    select;
+        when(heat_index<=20) do; heat_band="VL"; heat_score=30; end;
+        when(heat_index<=40) do; heat_band="L"; heat_score=80; end;
+        when(heat_index<=60) do; heat_band="M"; heat_score=150; end;
+        when(heat_index<=80) do; heat_band="H"; heat_score=250; end;
+        otherwise do; heat_band="C"; heat_score=380; end;
+    end;
+run;
+data CREDIT.SCORE_DROUGHT;
+    set CREDIT.CLIMATE_SCORECARD_BASE;
+
+    drought_index = min(100,(drought_index_raw/5)*100);
+
+    if drought_index<=20 then do; drought_band="VL"; drought_score=20; end;
+    else if drought_index<=40 then do; drought_band="L"; drought_score=60; end;
+    else if drought_index<=60 then do; drought_band="M"; drought_score=140; end;
+    else if drought_index<=80 then do; drought_band="H"; drought_score=260; end;
+    else do; drought_band="C"; drought_score=380; end;
+run;
+
+6.5.3 — SAS Code
+data CREDIT.SCORE_STORM;
+    set CREDIT.CLIMATE_SCORECARD_BASE;
+
+    storm_index = min(100,((storm_speed_raw-20)/160)*100);
+
+    if storm_index<=20 then do; storm_band="VL"; storm_score=25; end;
+    else if storm_index<=40 then do; storm_band="L"; storm_score=90; end;
+    else if storm_index<=60 then do; storm_band="M"; storm_score=180; end;
+    else if storm_index<=80 then do; storm_band="H"; storm_score=300; end;
+    else do; storm_band="C"; storm_score=420; end;
+run;
+6.6.3 — SAS Code
+data CREDIT.SCORE_SEALEVEL;
+    set CREDIT.CLIMATE_SCORECARD_BASE;
+
+    sealevel_index = min(100,(sea_level_rise_cm_raw/60)*100);
+
+    if sealevel_index<=20 then sealevel_score=40;
+    else if sealevel_index<=40 then sealevel_score=100;
+    else if sealevel_index<=60 then sealevel_score=200;
+    else if sealevel_index<=80 then sealevel_score=320;
+    else sealevel_score=450;
+run;
+SAS Code
+proc sql;
+    create table CREDIT.PHYSICAL_HAZARD_STAGE1 as
+    select a.cust_id,
+           flood_index, flood_score,
+           heat_index, heat_score,
+           drought_index, drought_score,
+           storm_index, storm_score,
+           sealevel_index, sealevel_score,
+           ndvi_index, ndvi_score
+    from CREDIT.SCORE_FLOOD a
+    left join CREDIT.SCORE_HEATWAVE b on a.cust_id=b.cust_id
+    left join CREDIT.SCORE_DROUGHT c  on a.cust_id=c.cust_id
+    left join CREDIT.SCORE_STORM d    on a.cust_id=d.cust_id
+    left join CREDIT.SCORE_SEALEVEL e on a.cust_id=e.cust_id
+    left join CREDIT.SCORE_NDVI f     on a.cust_id=f.cust_id;
+quit;
+
+
+proc means data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE n nmiss 
+           min max mean std maxdec=2;
+    var 
+        /* Physical Hazard */
+        flood_index heat_index drought_index storm_index sealevel_index
+        ndvi_vulnerability
+
+        /* Transition */
+        transition_risk_idx trans_idx_100 emissions_intensity_idx
+        energyshock_index carbon_index emiss_idx_100
+
+        /* Vulnerability */
+        exposure_index_from_raw exposure_index_existing
+        vuln_index_from_raw vuln_index_existing
+
+        /* Readiness */
+        governance_risk_index policy_risk_index disclosure_risk_index
+        renewable_readiness_index datareadiness_risk_index
+
+        /* Resilience */
+        buffer_risk_index insurance_risk_index infra_resilience_risk_index
+        supplychain_risk_index emergency_risk_index digital_risk_index
+        bcp_risk_index
+
+        /* Portfolio */
+        portpd_risk_index sector_conc_risk_index highrisk_obligor_index
+        highrisk_asset_index stressloss_risk_index green_exposure_risk_index
+
+        /* Composite Scores */
+        PCCI TCCI VULNCI RCI RSI PCI MCRI;
+run;
+
+/*----------------------------------------------------------------
+   2. FREQ Analysis — Check if values fall within expected bands
+----------------------------------------------------------------*/
+
+proc format;
+    value rng
+        low - <0       = "Below 0 (Error)"
+        0 - <25        = "0–25"
+        25 - <50       = "25–50"
+        50 - <75       = "50–75"
+        75 - 100       = "75–100"
+        100<- high     = "Above 100 (Error)";
+run;
+
+/* Apply format to key composite indices */
+proc freq data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+    tables 
+        PCCI TCCI VULNCI RCI RSI PCI MCRI
+        / missing;
+    format 
+        PCCI TCCI VULNCI RCI RSI PCI MCRI rng.;
+run;
+
+/*----------------------------------------------------------------
+   3. Segment-Wise Validation 
+----------------------------------------------------------------*/
+
+proc means data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE n min max mean std maxdec=2;
+    class segment;
+    var PCCI TCCI VULNCI RCI RSI PCI MCRI;
+run;
+
+/*----------------------------------------------------------------
+   4. Check for Outliers Beyond 0–100 Range
+----------------------------------------------------------------*/
+
+data OUT_OF_RANGE;
+    set CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+    array scores[*] 
+        PCCI TCCI VULNCI RCI RSI PCI MCRI;
+
+    do i=1 to dim(scores);
+        if scores[i] < 0 or scores[i] > 100 then output;
+    end;
+run;
+
+/* Count outliers */
+proc sql;
+    select count(*) as outlier_count
+    from OUT_OF_RANGE;
+quit;
+
+/*----------------------------------------------------------------
+   5. Detailed Distribution by Hazard/Transition/Vulnerability Types
+----------------------------------------------------------------*/
+
+proc univariate data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE noprint;
+    var 
+        flood_index heat_index drought_index storm_index sealevel_index
+        transition_risk_idx emiss_idx_100 carbon_index energyshock_index
+        exposure_index_existing vuln_index_existing 
+        governance_risk_index renewable_readiness_index
+        buffer_risk_index insurance_risk_index infra_resilience_risk_index;
+    histogram / midpoints=0 to 100 by 10;
+run;
+data CREDIT.CLIMATE_SCORECARD_BANDS;
+    set CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+
+    length riskband_pcci 
+           riskband_tcci 
+           riskband_vulnci
+           riskband_rci 
+           riskband_rsi
+           riskband_pci
+           riskband_mcri $20;
+
+    /* Macro to assign bands */
+    %macro band(var,rvar);
+        if &var < 25 then &rvar = "0–25 Very High";
+        else if &var < 50 then &rvar = "25–50 High";
+        else if &var < 75 then &rvar = "50–75 Moderate";
+        else &rvar = "75–100 Low";
+    %mend;
+
+    %band(PCCI, riskband_pcci);
+    %band(TCCI, riskband_tcci);
+    %band(VULNCI, riskband_vulnci);
+    %band(RCI,   riskband_rci);
+    %band(RSI,   riskband_rsi);
+    %band(PCI,   riskband_pci);
+    %band(MCRI,  riskband_mcri);
+run;
+
+This dataset becomes the foundation of:
+•	Climate EWS
+•	Sector-level heatmaps
+•	Customer onboarding climate checks
+•	Portfolio steering committees
+•	Climate disclosures (IFRS-S2, ECB, APRA)
+
+-----------------------------------------------------------------
+SECTION 4 — Business Interpretation of Each Scorecard
+Climate Scorecard 1: Physical Hazard Scorecard (PCCI) — "Exposure to physical climate shocks"
+•	Captures flood, heatwave, drought, storm, sea-level rise.
+•	Directly impacts PD and collateral values, especially mortgages, auto loans, SME loans.
+•	High PCCI → lower PD impact under NGFS stress.
+
+title "Physical Hazard Scorecard — Sample Records";
+proc print data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE(obs=10)
+           noobs label;
+    var cust_id flood_index heat_index drought_index PCCI;
+    label flood_index="Flood Index"
+          heat_index="Heatwave Index"
+          drought_index="Drought Severity"
+          PCCI="Physical Hazard Composite Index";
+run;
+title;
+
+title "Transition Risk Scorecard — Sample Records";
+proc print data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE(obs=10)
+           noobs label;
+    var cust_id transition_risk_idx trans_idx_100 emiss_idx_100 TCCI;
+    label transition_risk_idx="Transition Risk Index"
+          trans_idx_100="Transition Index (0–100)"
+          emiss_idx_100="Emissions Index (0–100)"
+          TCCI="Transition Composite Index";
+run;
+title;
+title "Vulnerability Scorecard — Sample Records";
+
+proc print data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE(obs=10)
+           noobs label;
+    var cust_id exposure_index_from_raw exposure_index_existing 
+        vuln_index_existing VULNCI;
+    label exposure_index_from_raw="Exposure Index (Derived)"
+          exposure_index_existing="Exposure Index (Existing)"
+title "Readiness Scorecard — Sample Records";
+
+proc print data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE(obs=10)
+           noobs label;
+    var cust_id governance_risk_index disclosure_risk_index 
+        renewable_readiness_index RCI;
+    label governance_risk_index="Governance Risk"
+          disclosure_risk_index="Disclosure Risk"
+          renewable_readiness_index="Renewable Energy Gap"
+          RCI="Readiness Composite Index";
+run;
+title;
+
+title "Resilience Scorecard — Sample Records";
+proc print data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE(obs=10)
+           noobs label;
+    var cust_id buffer_risk_index insurance_risk_index 
+        infra_resilience_risk_index RSI;
+    label buffer_risk_index="Financial Buffer Risk"
+          insurance_risk_index="Insurance Gap Risk"
+          infra_resilience_risk_index="Infrastructure Resilience Risk"
+          RSI="Resilience Composite Index";
+run;
+title;
+title "Portfolio Scorecard — Sample Records";
+
+proc print data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE(obs=10)
+           noobs label;
+    var cust_id exposure_risk_index highrisk_asset_index 
+        sector_conc_risk_index PCI;
+    label exposure_risk_index="Exposure Risk"
+          highrisk_asset_index="High-Risk Asset Share"
+          sector_conc_risk_index="Sector Concentration"
+          PCI="Portfolio Composite Index";
+run;
+title;
+
+title "Master Climate Risk Score — Sample Records";
+proc print data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE(obs=10)
+           noobs label;
+    var cust_id PCCI TCCI VULNCI MCRI;
+    label PCCI="Physical Composite"
+          TCCI="Transition Composite"
+          VULNCI="Vulnerability Composite"
+          MCRI="Master Climate Risk Index";
+run;
+title;
+
+proc means data=CREDIT.CLIMATE_SCORECARD_BANDS n nmiss min max mean std;
+    var PCCI TCCI VULNCI RCI RSI PCI MCRI;
+run;
+
+data CREDIT.CLIMATE_SEGMENTED;
+    set CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+
+    length climate_segment $20;
+
+    if MCRI < 20 then climate_segment = 'Very Low Risk';
+    else if MCRI < 40 then climate_segment = 'Low Risk';
+    else if MCRI < 60 then climate_segment = 'Moderate Risk';
+    else if MCRI < 80 then climate_segment = 'High Risk';
+    else climate_segment = 'Very High Risk';
+run;
+title "Climate Segment Distribution";
+proc freq data=CREDIT.CLIMATE_SEGMENTED;
+    tables climate_segment / nocum nopercent;
+run;
+
+title "Climate Score Averages by Segment";
+proc means data=CREDIT.CLIMATE_SEGMENTED mean min max std;
+    class climate_segment;
+    var PCCI TCCI VULNCI RCI RSI PCI MCRI;
+run;
+title;
+proc print data=CREDIT.CLIMATE_SEGMENTED(obs=5);
+    where climate_segment="High Risk";
+    var cust_id region sector MCRI PCCI TCCI VULNCI;
+run;
+
+proc means data=credit.climate_combined_score_table n nmiss min max mean std;
+    var flood_index heat_index drought_index storm_index sealevel_index
+        ndvi_vulnerability transition_risk_idx trans_idx_100 emissions_intensity_idx
+        energyshock_index carbon_index emiss_idx_100
+        exposure_index_from_raw exposure_index_existing
+        vuln_index_from_raw vuln_index_existing
+        governance_risk_index policy_risk_index disclosure_risk_index
+        renewable_readiness_index datareadiness_risk_index buffer_risk_index
+        insurance_risk_index infra_resilience_risk_index supplychain_risk_index
+        emergency_risk_index digital_risk_index bcp_risk_index portpd_risk_index
+        sector_conc_risk_index highrisk_obligor_index highrisk_asset_index
+        stressloss_risk_index green_exposure_risk_index
+        PCCI TCCI VULNCI RCI RSI PCI MCRI;
+run;
+proc freq data=credit.climate_combined_score_table;
+    tables PCCI TCCI VULNCI RCI RSI PCI MCRI / nocum;
+run;
+proc means data=credit.climate_combined_score_table n min max mean std;
+    class segment;
+    var PCCI TCCI VULNCI RCI RSI PCI MCRI;
+run;
+/*==============================================================
+ STEP 1 — Create CLIMATE_EWI_FLAGS2 with enriched MCRI
+==============================================================*/
+data CREDIT.CLIMATE_EWI_FLAGS2;
+    set CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+
+    call streaminit(27012025);
+
+    length MCRI_enriched 8 MCRI_bucket $20;
+
+    p = rand("uniform");
+
+    /* Corporate — highest disclosure */
+    if segment = "Corporate" then do;
+        if      p < 0.20 then MCRI_enriched = rand("normal", 20, 8);
+        else if p < 0.40 then MCRI_enriched = rand("normal", 40, 10);
+        else if p < 0.50 then MCRI_enriched = rand("normal", 70, 12);
+        else                   MCRI_enriched = .;
+    end;
+
+    /* SME — medium-low disclosure */
+    else if segment = "SME" then do;
+        if      p < 0.10 then MCRI_enriched = rand("normal", 20, 10);
+        else if p < 0.20 then MCRI_enriched = rand("normal", 40, 12);
+        else if p < 0.25 then MCRI_enriched = rand("normal", 70, 15);
+        else                   MCRI_enriched = .;
+    end;
+
+    /* Retail — almost no disclosure */
+    else if segment = "Retail" then do;
+        if      p < 0.02 then MCRI_enriched = rand("normal", 35, 12);
+        else                   MCRI_enriched = .;
+    end;
+
+    /* Clamp values */
+    if MCRI_enriched < 0 then MCRI_enriched = 0;
+    if MCRI_enriched > 100 then MCRI_enriched = 100;
+
+    /* Bucket assignment */
+    if MCRI_enriched = . then MCRI_bucket = "No_Disclosure";
+    else if MCRI_enriched < 30 then MCRI_bucket = "Low_Risk";
+    else if MCRI_enriched < 60 then MCRI_bucket = "Moderate_Risk";
+    else                           MCRI_bucket = "High_Risk";
+
+run;
+proc freq data=CREDIT.CLIMATE_EWI_FLAGS2;
+    tables MCRI_bucket / nocum;
+run;
+proc contents data=CREDIT.CLIMATE_EWI_FLAGS2;
+run;
+data credit.climate_combined_score_table_m1;
+    set credit.climate_combined_score_table;
+
+    /* Month-1 values (baseline) */
+    PCCI_m1   = PCCI;
+    TCCI_m1   = TCCI;
+    VULNCI_m1 = VULNCI;
+    PCI_m1    = PCI;
+    MCRI_m1   = MCRI;
+run;
+
+data credit.climate_combined_score_table_m2;
+    set credit.climate_combined_score_table;
+
+    /* Randomised monthly movement simulation */
+    PCCI_m2   = PCCI   + round(rannor(123)*2,1);
+    TCCI_m2   = TCCI   + round(rannor(123)*2,1);
+    VULNCI_m2 = VULNCI + round(rannor(123)*2,1);
+    PCI_m2    = PCI    + round(rannor(123)*1.5,1);
+    MCRI_m2   = MCRI   + round(rannor(123)*1.5,1);
+
+    /* Ensure values stay within valid ranges 0–100 */
+    array vars PCCI_m2 TCCI_m2 VULNCI_m2 PCI_m2 MCRI_m2;
+    do i=1 to dim(vars);
+        if vars[i] < 0 then vars[i]=0;
+        if vars[i] > 100 then vars[i]=100;
+    end;
+    drop i;
+run;
+
+proc sort data=credit.climate_combined_score_table_m1; by cust_id; run;
+proc sort data=credit.climate_combined_score_table_m2; by cust_id; run;
+
+data credit.climate_score_movement;
+    merge credit.climate_combined_score_table_m1(in=a)
+          credit.climate_combined_score_table_m2(in=b);
+    by cust_id;
+if a and b;
+
+    /* Movement calculations */
+    delta_PCCI  = PCCI_m2  - PCCI_m1;
+    delta_TCCI  = TCCI_m2  - TCCI_m1;
+    delta_VULNCI = VULNCI_m2 - VULNCI_m1;
+    delta_PCI   = PCI_m2   - PCI_m1;
+    delta_MCRI  = MCRI_m2  - MCRI_m1;
+
+    /* Worsening flags */
+    worsen_Physical        = (delta_PCCI  > 5);
+    worsen_Transition      = (delta_TCCI  > 5);
+    worsen_Vulnerability   = (delta_VULNCI > 5);
+    worsen_PortfolioImpact = (delta_PCI > 5);
+    worsen_Combined        = (delta_MCRI > 5);
+run;
+
+proc freq data=credit.climate_ewi_flags2;
+    tables MCRI_bucket / nocum norow nocol nopercent;
+run;
+proc means data=credit.climate_ewi_flags2 
+           n min max mean median stddev;
+    var MCRI MCRI_enriched;
+run;
+
+SAS:
+/*==============================================================
+ STEP 1: Create Climate Severe Alerts
+==============================================================*/
+data credit.climate_alerts;
+    set credit.climate_score_movement;
+
+    if  delta_PCCI  > 10 or
+        delta_TCCI  > 10 or
+        delta_VULNCI > 10 or
+        delta_PCI   > 10 or
+        delta_MCRI  > 10 then
+            climate_severe_alert = 1;
+    else climate_severe_alert = 0;
+run;
+
+
+/*==============================================================
+ STEP 2: Climate Alert Summary (FREQ)
+==============================================================*/
+proc freq data=credit.climate_alerts;
+    tables climate_severe_alert / nocum nopercent;
+    title "Climate Severe Alert Distribution";
+run;
+
+
+/*==============================================================
+ STEP 3: Climate Risk Change Summary (MEANS)
+==============================================================*/
+proc means data=credit.climate_alerts 
+           n min max mean median std;
+    var delta_PCCI delta_TCCI delta_VULNCI delta_PCI delta_MCRI;
+    title "Summary Statistics of Climate Risk Deterioration";
+run;
+
+
+/*==============================================================
+ STEP 4: Sort Worst Deteriorating Customers
+==============================================================*/
+proc sort data=credit.climate_alerts
+          out=credit.climate_worst;
+    by descending delta_MCRI;
+run;
+
+
+/*==============================================================
+ STEP 5: PRINT – Climate Risk Deterioration Summary (TOP 50)
+==============================================================*/
+proc print data=credit.climate_worst(obs=50) noobs;
+    var cust_id delta_PCCI delta_TCCI delta_VULNCI delta_PCI delta_MCRI climate_severe_alert;
+    title "Top 50 Customers – Climate Risk Deterioration Summary";
+run;
+
+
+/*==============================================================
+ STEP 6: PRINT – Detailed TOP 20 Worst Customers 
+==============================================================*/
+proc print data=credit.climate_worst(obs=20) noobs label;
+    var cust_id 
+        PCCI_m1  PCCI_m2  delta_PCCI
+        TCCI_m1  TCCI_m2  delta_TCCI
+        VULNCI_m1 VULNCI_m2 delta_VULNCI
+        MCRI_m1  MCRI_m2  delta_MCRI climate_severe_alert;
+
+    label cust_id   = "Customer ID"
+          PCCI_m1   = "Physical Risk (Before)"
+          PCCI_m2   = "Physical Risk (After)"
+          delta_PCCI = "Physical Risk Change"
+          TCCI_m1   = "Transition Risk (Before)"
+          TCCI_m2   = "Transition Risk (After)"
+          delta_TCCI = "Transition Risk Change"
+          VULNCI_m1 = "Vulnerability (Before)"
+          VULNCI_m2 = "Vulnerability (After)"
+          delta_VULNCI = "Vulnerability Change"
+          MCRI_m1   = "Combined Climate Risk (Before)"
+          MCRI_m2   = "Combined Climate Risk (After)"
+          delta_MCRI = "Total Climate Risk Deterioration"
+          climate_severe_alert = "Severe Alert Flag";
+
+    title "Top 20 Customers with Highest Climate Risk Deterioration";
+run;
+
+proc means data=credit.climate_score_movement mean std min max;
+    var delta_PCCI delta_TCCI delta_VULNCI delta_PCI delta_MCRI;
+run;
+proc means data=base nway;
+    var PCCI TCCI VULNCI PCI MCRI;
+    weight weight;
+    output out=credit.portfolio_climate_scores
+        mean(PCCI)=PHPI
+        mean(TCCI)=TRPI
+        mean(VULNCI)=VPI
+        mean(PCI)=Portfolio_Impact_Index
+        mean(MCRI)=Master_Climate_Risk_Index;
+run;
+proc means data=base nway;
+    class segment;
+    var PCCI TCCI VULNCI PCI MCRI;
+    output out=credit.segment_climate_scores
+        mean(PCCI)=PHPI
+        mean(TCCI)=TRPI
+        mean(VULNCI)=VPI
+        mean(PCI)=PortfolioImpact
+        mean(MCRI)=MCRI_Score;
+run;
+proc means data=base nway;
+    class product_type;
+    var MCRI;
+    output out=credit.product_climate_risk mean=avg_mcri std=std_mcri;
+run;
+proc means data=base nway;
+    class region;
+    var MCRI;
+    output out=credit.region_climate_risk mean=avg_mcri std=std_mcri;
+run
+/*=========================================================
+   STEP 1 — COMPUTE CHRC FOR EACH CUSTOMER
+=========================================================*/
+
+data CREDIT.CLIMATE_CUSTOMER_CHRC;
+    set CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+
+    /* Convert readiness/resilience to risk */
+    readiness_risk  = 100 - RCI;
+    resilience_risk = 100 - RSI;
+
+    /* Option C – Portfolio Optimized Weight Model */
+    CHRC =
+          0.35 * PCCI
+        + 0.25 * TCCI
+        + 0.20 * VULNCI
+        + 0.10 * readiness_risk
+        + 0.10 * resilience_risk;
+
+    /* Classification into 4 groups */
+    length CHRC_Class $20;
+
+    if CHRC < 25 then CHRC_Class = "1–Low Risk";
+    else if CHRC < 50 then CHRC_Class = "2–Moderate Risk";
+    else if CHRC < 75 then CHRC_Class = "3–High Risk";
+    else CHRC_Class = "4–Severe Risk";
+run;
+
+/*=========================================================
+   STEP 2 — FREQUENCY DISTRIBUTION OF CLASSES
+=========================================================*/
+
+proc freq data=CREDIT.CLIMATE_CUSTOMER_CHRC;
+    tables CHRC_Class / nocum norow nocol nopercent;
+run;
+
+/*=========================================================
+   STEP 3 — RANGE CHECK
+=========================================================*/
+
+proc means data=CREDIT.CLIMATE_CUSTOMER_CHRC n min max mean;
+    var CHRC PCCI TCCI VULNCI RCI RSI;
+run;
+
+/*=========================================================
+   STEP 4 — SEGMENT–LEVEL PROFILE
+=========================================================*/
+
+proc means data=CREDIT.CLIMATE_CUSTOMER_CHRC n mean stddev;
+    class segment;
+    var CHRC PCCI TCCI VULNCI RCI RSI;
+run;
+
+
+/*========================================================*/
+/* CHAPTER 12 – MASTER SAMPLE DATASET FOR ALL EXAMPLES   */
+/*========================================================*/
+
+data CREDIT.CLIMATE_CUSTOMER_CHRC;
+    call streaminit(12345);
+
+    do cust_id = 1 to 10000;
+
+        /* ----------------------------- */
+        /* DEMOGRAPHIC & FINANCIAL CORE */
+        /* ----------------------------- */
+        age_years = rand("integer", 21, 65);
+        monthly_income = rand("uniform")*25000 + 5000;
+        loan_amount = rand("uniform")*450000 + 50000;
+        property_value = loan_amount * (1.15 + rand("uniform")*0.6);
+        monthly_instalment = loan_amount / rand("uniform")*(80 + rand("uniform")*180);
+        dbr_ratio = (monthly_instalment / monthly_income)*100;
+
+        tenure_months = rand("integer", 24, 300);
+
+        /* ----------------------------- */
+        /* DPD & CREDIT BEHAVIOR         */
+        /* ----------------------------- */
+        dpd_30plus_12m = rand("bernoulli",0.30);
+        dpd_60plus_12m = rand("bernoulli",0.18);
+        dpd_max_12m = rand("integer",0,90);
+
+        /* ----------------------------- */
+        /* BASE PD / DEFAULT FLAG        */
+        /* ----------------------------- */
+        base_pd = (dbr_ratio/100)*0.4 + (dpd_max_12m/100)*0.6;
+        default_flag = (rand("uniform") < base_pd);
+
+        /* ----------------------------- */
+        /* CLIMATE RAW HAZARDS           */
+        /* ----------------------------- */
+        flood_index  = rand("uniform")*100;
+        heat_index   = rand("uniform")*100;
+        storm_index  = rand("uniform")*100;
+        drought_index = rand("uniform")*100;
+        sealevel_index = rand("uniform")*100;
+
+        /* ----------------------------- */
+        /* TRANSITION & ESG RAW          */
+        /* ----------------------------- */
+        carbon_index = rand("uniform")*100;
+        emissions_intensity_idx = rand("uniform")*100;
+        transition_risk_idx = rand("uniform")*100;
+        greeninv_risk_index = rand("uniform")*100;
+        governance_risk_index = rand("uniform")*100;
+
+        /* ----------------------------- */
+        /* VULNERABILITY                 */
+        /* ----------------------------- */
+        ndvi_vulnerability = rand("uniform")*100;
+        vuln_index_from_raw = (flood_index + heat_index + storm_index)/3;
+        VULNCI = vuln_index_from_raw;
+
+        /* ----------------------------- */
+        /* PHYSICAL & TRANSITION CI      */
+        /* ----------------------------- */
+        PCCI = (flood_index + heat_index + drought_index + storm_index)/4;
+        TCCI = (carbon_index + emissions_intensity_idx + transition_risk_idx)/3;
+
+        /* ----------------------------- */
+        /* PORTFOLIO IMPACT              */
+        /* ----------------------------- */
+        PCI = (PCCI + TCCI + VULNCI)/3;
+
+        /* ----------------------------- */
+        /* MASTER CLIMATE RISK INDEX     */
+        /* ============================= */
+        CHRC = PCI;
+
+        output;
+    end;
+run;
+
+proc rank data=CREDIT.CLIMATE_CUSTOMER_CHRC
+          out=CHRC_QUANTILES
+          groups=4;
+    var CHRC;
+    ranks CHRC_Quartile;
+run;
+
+proc freq data=CHRC_QUANTILES;
+    tables CHRC_Quartile;
+run;
+3.2 CHRC by Segment
+
+data CREDIT.CLIMATE_CUSTOMER_CHRC;
+    set CREDIT.CLIMATE_CUSTOMER_CHRC;
+
+    /* ----------------------- */
+    /* SEGMENT CREATION        */
+    /* ----------------------- */
+    if mod(cust_id,3)=0 then segment='Retail';
+    else if mod(cust_id,3)=1 then segment='Corporate';
+    else segment='SME';
+
+    /* ----------------------- */
+    /* RESILIENCE INDEX (RCI)  */
+    /* ----------------------- */
+    RCI = 100 - VULNCI;
+
+    /* ----------------------- */
+    /* STRESS INDEX (RSI)      */
+    /* ----------------------- */
+    RSI = (PCCI + TCCI)/2;
+run;
+
+proc means data=CREDIT.CLIMATE_CUSTOMER_CHRC n mean stddev min max;
+    class segment;
+    var CHRC PCCI TCCI VULNCI RCI RSI;
+run;
+
+proc fastclus data=CREDIT.CLIMATE_CUSTOMER_CHRC
+              maxclusters=4
+              out=CHRC_CLUSTERS;
+    var CHRC PCCI TCCI VULNCI RCI RSI;
+run;
+proc means data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE n nmiss min max mean std;
+   var PCCI TCCI VULNCI RCI RSI PCI MCRI
+       flood_index heat_index drought_index storm_index sealevel_index
+       transition_risk_idx emiss_idx_100 carbon_index energyshock_index;
+run;
+
+2. Range Violation Check
+data range_check;
+   set CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+   array scores {*} PCCI TCCI VULNCI PCI MCRI;
+   do i = 1 to dim(scores);
+      if scores{i} < 0 or scores{i} > 100 then flag_range_violation = 1;
+   end;
+run;
+
+proc freq data=range_check;
+   tables flag_range_violation;
+run;
+3. Segment-Level Monitoring
+proc means data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE n min max mean std;
+   class segment;
+   var PCCI TCCI VULNCI PCI MCRI;
+run;
+
+4. Trend Monitoring (Month-on-Month Drift)
+Assuming you maintain separate monthly tables:
+
+proc sql;
+   create table score_drift as
+   select a.segment,
+          a.PCCI as pcci_prev,
+          b.PCCI as pcci_curr,
+          (b.PCCI - a.PCCI) / a.PCCI * 100 as pcci_drift_pct
+   from CREDIT.CLIMATE_COMBINED_SCORE_TABLE_M1 a
+   inner join CREDIT.CLIMATE_COMBINED_SCORE_TABLE_M2 b
+   on a.cust_id = b.cust_id;
+quit;
+
+5. Heatmap for Climate Score Drift
+proc sgplot data=CREDIT.CLIMATE_COMBINED_SCORE_TABLE;
+   heatmap x=segment y=product_type colorresponse=PCCI;
+run;
+
+16.2.1 SAS Code – Create CREDIT.ISLAMIC_SCORECARD_BASE
+/*---------------------------------------------------------------
+  Create a compact base dataset for Islamic scorecards
+  Products:
+    - IJARA_HOME      (lease-based home financing)
+    - MURABAHA_AUTO   (cost-plus sale for vehicle)
+    - MURABAHA_PERSONAL (personal finance)
+----------------------------------------------------------------*/
+
+libname CREDIT "/our/path/here";   /* adjust for our environment */
+
+/* Small demo dataset – 1000 rows */
+data CREDIT.ISLAMIC_SCORECARD_BASE;
+    call streaminit(12345);
+
+    do cust_id = 1 to 1000;
+
+        /* Product type */
+        if rand("uniform") < 0.45 then product_type = "IJARA_HOME";
+        else if rand("uniform") < 0.75 then product_type = "MURABAHA_AUTO";
+        else product_type = "MURABAHA_PERSONAL";
+
+        /* Basic demographics */
+        age_years = rand("integer", 22, 60);
+        monthly_income = rand("normal", 15000, 4000);
+        if monthly_income < 5000 then monthly_income = 5000;
+
+        /* Facility details */
+        loan_amount = rand("uniform") * 400000 + 50000;   /* 50k – 450k */
+        property_value = loan_amount / (0.6 + rand("uniform") * 0.3);  /* LTV ~ 60–90% */
+
+        /* Shariah-compliant profit rate (%) by product */
+        select (product_type);
+            when ("IJARA_HOME")        profit_rate_pct = rand("normal", 4.0, 0.5);
+            when ("MURABAHA_AUTO")     profit_rate_pct = rand("normal", 5.5, 0.7);
+            otherwise                  profit_rate_pct = rand("normal", 7.5, 1.0);
+        end;
+
+        /* Tenure */
+        tenure_months = rand("integer", 24, 300);
+
+        /* Behaviour – last 12 months */
+        dpd_30plus_12m = rand("integer", 0, 5);
+        dpd_60plus_12m = (dpd_30plus_12m > 0) * rand("integer", 0, 3);
+        dpd_max_12m    = max(30 * (dpd_30plus_12m>0), 60 * (dpd_60plus_12m>0));
+
+        /* Income stress: instalment vs income */
+        /* Simple EMI-style approximation */
+        monthly_instalment = (loan_amount * (profit_rate_pct/100) / 12) /
+                             (1 - (1 + (profit_rate_pct/100)/12)**(-tenure_months));
+
+        dbr_ratio = min( 200,
+                         (monthly_instalment / monthly_income) * 100 );
+
+        /* Final target – default_flag (toy, approx 6–7% default rate) */
+        base_pd = 0.04;
+
+        if dpd_max_12m >= 60 then base_pd + 0.10;
+        else if dpd_max_12m >= 30 then base_pd + 0.05;
+
+        if dbr_ratio > 80 then base_pd + 0.05;
+        else if dbr_ratio > 60 then base_pd + 0.02;
+
+        if profit_rate_pct > 8 then base_pd + 0.03;
+
+        /* Clamp base_pd to [0.01, 0.40] */
+        if base_pd < 0.01 then base_pd = 0.01;
+        if base_pd > 0.40 then base_pd = 0.40;
+
+        /* Simulate default via Bernoulli draw */
+        default_flag = (rand("uniform") < base_pd);
+
+        output;
+    end;
+run;
+
+/* Quick sanity check */
+proc contents data=CREDIT.ISLAMIC_SCORECARD_BASE; run;
+
+proc means data=CREDIT.ISLAMIC_SCORECARD_BASE n mean min max;
+    var loan_amount property_value profit_rate_pct tenure_months
+        monthly_income monthly_instalment dbr_ratio dpd_max_12m default_flag;
+run;
+
+proc freq data=CREDIT.ISLAMIC_SCORECARD_BASE;
+    tables product_type*default_flag / norow nocol nopercent;
+run;
+data CREDIT.ISLAMIC_APP_SCORE;
+    set CREDIT.ISLAMIC_SCORECARD_BASE;
+
+    /* Only for financing products, you can restrict if needed */
+    /* LTV */
+    ltv_pct = (loan_amount / property_value) * 100;
+
+    length app_score_reason $200.;
+    app_score_reason = "";
+
+    /* LTV points */
+    if ltv_pct <= 60 then do; pts_ltv = 20; app_score_reason = cats(app_score_reason,"LTV<=60; "); end;
+    else if 60 < ltv_pct <= 75 then do; pts_ltv = 10; app_score_reason = cats(app_score_reason,"LTV60-75; "); end;
+    else if 75 < ltv_pct <= 90 then do; pts_ltv = 0;  app_score_reason = cats(app_score_reason,"LTV75-90; "); end;
+    else do; pts_ltv = -15; app_score_reason = cats(app_score_reason,"LTV>90; "); end;
+
+    /* DBR points */
+    if dbr_ratio <= 35 then do; pts_dbr = 20; app_score_reason = cats(app_score_reason,"DBR<=35; "); end;
+    else if dbr_ratio <= 50 then do; pts_dbr = 10; app_score_reason = cats(app_score_reason,"DBR35-50; "); end;
+    else if dbr_ratio <= 70 then do; pts_dbr = 0;  app_score_reason = cats(app_score_reason,"DBR50-70; "); end;
+    else do; pts_dbr = -20; app_score_reason = cats(app_score_reason,"DBR>70; "); end;
+
+    /* Profit rate points */
+    if profit_rate_pct <= 4.5 then do; pts_profit = 10; app_score_reason = cats(app_score_reason,"Profit<=4.5; "); end;
+    else if profit_rate_pct <= 6.5 then do; pts_profit = 0;  app_score_reason = cats(app_score_reason,"Profit4.5-6.5; "); end;
+    else do; pts_profit = -10; app_score_reason = cats(app_score_reason,"Profit>6.5; "); end;
+
+    /* Tenure points */
+    if tenure_months <= 120 then do; pts_tenure = 10; app_score_reason = cats(app_score_reason,"Tenure<=120; "); end;
+    else if tenure_months <= 240 then do; pts_tenure = 0;  app_score_reason = cats(app_score_reason,"Tenure120-240; "); end;
+    else do; pts_tenure = -10; app_score_reason = cats(app_score_reason,"Tenure>240; "); end;
+
+    /* Final Application Score */
+    islamic_app_score = sum(pts_ltv, pts_dbr, pts_profit, pts_tenure);
+
+    /* Simple banding */
+    length islamic_app_band $20.;
+    if islamic_app_score >= 40 then islamic_app_band = "Very Low Risk";
+    else if islamic_app_score >= 20 then islamic_app_band = "Low Risk";
+    else if islamic_app_score >= 0  then islamic_app_band = "Medium Risk";
+    else islamic_app_band = "High Risk";
+
+run;
+
+/* For the book – tiny snapshot of 10 rows */
+proc print data=CREDIT.ISLAMIC_APP_SCORE (obs=10);
+    var cust_id product_type loan_amount property_value ltv_pct
+        monthly_income monthly_instalment dbr_ratio
+        profit_rate_pct tenure_months
+        islamic_app_score islamic_app_band;
+    title "Sample Rows – Islamic Application PD Scorecard";
+run;
+
+/* Distribution by band */
+proc freq data=CREDIT.ISLAMIC_APP_SCORE;
+    tables islamic_app_band / nocum;
+    title "Islamic Application Score – Band Distribution";
+run;
+title;
+
+16.4.2 SAS Code
+data CREDIT.ISLAMIC_BEHAV_SCORE;
+    set CREDIT.ISLAMIC_SCORECARD_BASE;
+
+    length beh_score_band $20.;
+
+    /* DPD score */
+    if dpd_max_12m = 0 then pts_dpd = 25;
+    else if dpd_max_12m <= 30 then pts_dpd = 10;
+    else if dpd_max_12m <= 60 then pts_dpd = -10;
+    else pts_dpd = -25;
+
+    /* DBR score */
+    if dbr_ratio <= 40 then pts_beh_dbr = 15;
+    else if dbr_ratio <= 60 then pts_beh_dbr = 0;
+    else pts_beh_dbr = -10;
+
+    /* Product group */
+    if product_type = "IJARA_HOME" then pts_product = 5;
+    else pts_product = 0;
+
+    islamic_behavior_score = sum(pts_dpd, pts_beh_dbr, pts_product);
+
+    if islamic_behavior_score >= 30 then beh_score_band = "Excellent";
+    else if islamic_behavior_score >= 15 then beh_score_band = "Good";
+    else if islamic_behavior_score >= 0 then beh_score_band = "Watch";
+    else beh_score_band = "At Risk";
+
+run;
+
+proc freq data=CREDIT.ISLAMIC_BEHAV_SCORE;
+    tables beh_score_band / nocum;
+    title "Islamic Behavioral Score – Band Distribution";
+run;
+title;
+
+data CREDIT.ISLAMIC_COLLECTION_SCORE;
+    set CREDIT.ISLAMIC_SCORECARD_BASE;
+
+    length coll_band $20.;
+
+    coll_score = 0;
+
+    /* DPD impact */
+    if dpd_max_12m = 0 then coll_score + 0;
+    else if dpd_max_12m <= 30 then coll_score + 10;
+    else if dpd_max_12m <= 60 then coll_score + 20;
+    else coll_score + 30;
+
+    /* DBR impact */
+    if dbr_ratio > 70 then coll_score + 20;
+    else if dbr_ratio > 50 then coll_score + 10;
+
+    /* Product impact – short-tenor personal / auto finance is more sensitive */
+    if product_type = "MURABAHA_PERSONAL" then coll_score + 10;
+    else if product_type = "MURABAHA_AUTO" then coll_score + 5;
+
+    if coll_score >= 40 then coll_band = "High Priority";
+    else if coll_score >= 20 then coll_band = "Medium";
+    else coll_band = "Low";
+
+run;
+
+proc freq data=CREDIT.ISLAMIC_COLLECTION_SCORE;
+    tables coll_band / nocum;
+    title "Islamic Collections / EWS Score – Priority Bands";
+run;
+title;
+
+proc print data=CREDIT.ISLAMIC_COLLECTION_SCORE (obs=8);
+    var cust_id product_type dpd_max_12m dbr_ratio coll_score coll_band;
+    title "Sample Rows – Islamic Collections Priority Score";
+run;
+title;
+proc means data=CREDIT.ESG_RAW noprint;
+    var carbon_emission_intensity_raw
+        waste_management_score_raw
+        renewable_energy_usage_pct_raw
+        water_usage_efficiency_raw
+        employee_welfare_score_raw
+        gender_diversity_pct_raw
+        community_impact_score_raw
+        customer_grievance_ratio_raw
+        governance_transparency_raw
+        board_independence_pct_raw
+        anti_corruption_rating_raw
+        tax_compliance_score_raw;
+
+    output out=limits
+        p1 =
+            ci_p1 wm_p1 re_p1 water_p1 wel_p1 gender_p1 comm_p1 griev_p1
+            gov_p1 board_p1 ac_p1 tax_p1
+        p99 =
+            ci_p99 wm_p99 re_p99 water_p99 wel_p99 gender_p99 comm_p99 griev_p99
+            gov_p99 board_p99 ac_p99 tax_p99
+    ;
+run;
+
+STEP 2 — Raw → Index Conversion (ESG_STAGE1)
+data ESG_STAGE1;
+    if _n_=1 then set limits;
+    set CREDIT.ESG_RAW;
+
+    %macro pos(raw, min, max, idx);
+        &idx = max(0, min(100, 100 * ((&raw - &min) / (&max - &min))));
+    %mend;
+
+    %macro neg(raw, min, max, idx);
+        &idx = max(0, min(100, 100 - 100 * ((&raw - &min) / (&max - &min))));
+    %mend;
+
+    /* Environmental */
+    %pos(waste_management_score_raw, wm_p1, wm_p99, wm_idx)
+    %pos(renewable_energy_usage_pct_raw, re_p1, re_p99, re_idx)
+    %pos(water_usage_efficiency_raw, water_p1, water_p99, water_idx)
+    %neg(carbon_emission_intensity_raw, ci_p1, ci_p99, ei_idx)
+
+    /* Social */
+    %pos(employee_welfare_score_raw, wel_p1, wel_p99, wel_idx)
+    %pos(gender_diversity_pct_raw, gender_p1, gender_p99, gender_idx)
+    %pos(community_impact_score_raw, comm_p1, comm_p99, comm_idx)
+    %neg(customer_grievance_ratio_raw, griev_p1, griev_p99, griev_idx)
+
+    /* Governance */
+    %pos(governance_transparency_raw, gov_p1, gov_p99, gov_idx)
+    %pos(board_independence_pct_raw, board_p1, board_p99, board_idx)
+    %pos(anti_corruption_rating_raw, ac_p1, ac_p99, ac_idx)
+    %pos(tax_compliance_score_raw, tax_p1, tax_p99, tax_idx)
+    ;
+run;
+
+STEP 3 — E, S, G Sub-Scores
+data ESG_STAGE2;
+    set ESG_STAGE1;
+
+    E_SCORE = 0.40*ei_idx + 0.25*re_idx + 0.20*wm_idx + 0.15*water_idx;
+    S_SCORE = 0.35*wel_idx + 0.25*gender_idx + 0.20*comm_idx + 0.20*griev_idx;
+    G_SCORE = 0.40*gov_idx + 0.30*board_idx + 0.20*ac_idx + 0.10*tax_idx;
+run;
+
+STEP 4 — Final ESG Score & Scorebands
+data CREDIT.ESG_SCORECARD;
+    set ESG_STAGE2;
+
+    select (segment);
+        when ('Corporate')
+            ESG_SCORE = 0.35*E_SCORE + 0.25*S_SCORE + 0.40*G_SCORE;
+        when ('SME')
+            ESG_SCORE = 0.40*E_SCORE + 0.35*S_SCORE + 0.25*G_SCORE;
+        when ('Retail')
+            ESG_SCORE = 0.35*E_SCORE + 0.45*S_SCORE + 0.20*G_SCORE;
+        otherwise
+            ESG_SCORE = mean(E_SCORE, S_SCORE, G_SCORE);
+    end;
+
+    if      ESG_SCORE >= 80 then ESG_BAND = 'Excellent';
+    else if ESG_SCORE >= 60 then ESG_BAND = 'Good';
+    else if ESG_SCORE >= 40 then ESG_BAND = 'Moderate';
+    else if ESG_SCORE >= 20 then ESG_BAND = 'Weak';
+    else                         ESG_BAND = 'Severe';
+run;
+
+STEP 5 — Validation (PROC MEANS, PROC FREQ)
+Distribution of Scores
+proc means data=CREDIT.ESG_SCORECARD n min max mean stddev;
+    var E_SCORE S_SCORE G_SCORE ESG_SCORE;
+run;
+Scoreband Distribution
+proc freq data=CREDIT.ESG_SCORECARD;
+    tables ESG_BAND;
+run;
+Segment × Scoreband Matrix
+proc freq data=CREDIT.ESG_SCORECARD;
+    tables segment * ESG_BAND / norow nocol nopercent;
+run;
+
+SAS Graph (PD Over Time)
+/* Sample monthly PD trend by ESG weakness (for plotting) */
+data case_esg_pd;
+    format month monyy7.;
+    input month :monyy7. pd;
+    datalines;
+JAN2024 2.1
+FEB2024 2.3
+MAR2024 2.5
+APR2024 2.8
+MAY2024 3.0
+JUN2024 3.4
+JUL2024 3.8
+AUG2024 4.1
+SEP2024 4.3
+OCT2024 4.5
+NOV2024 4.7
+DEC2024 5.0
+;
+run;
+
+/* Quick check */
+proc print data=case_esg_pd(obs=12);
+    title "Monthly PD Trend for ESG-Weak Exposures";
+run;
+title;
+
+proc sgplot data=case_esg_pd;
+    series x=month y=pd / markers lineattrs=(thickness=2);
+    refline 4 / axis=y label="ESG-Weak PD Threshold (4%)" lineattrs=(pattern=shortdash);
+    yaxis label="Probability of Default (%)";
+    xaxis label="Month";
+    title "Impact of ESG Weakness on Monthly PD Trend";
+run;
+title;
+data case_esg_pd;
+    format month monyy7.;
+    input month :monyy7. pd;
+    datalines;
+JAN2024 2.1
+FEB2024 2.3
+MAR2024 2.5
+APR2024 2.8
+MAY2024 3.0
+JUN2024 3.4
+JUL2024 3.8
+AUG2024 4.1
+SEP2024 4.3
+OCT2024 4.5
+NOV2024 4.7
+DEC2024 5.0
+;
+run;
+
+proc sgplot data=case_esg_pd;
+    series x=month y=pd / markers;
+    refline 4 / axis=y label="ESG Weak Early-Warning Zone";
+    yaxis label="Probability of Default (%)";
+    xaxis label="Month";
+    title "Monthly PD Trend for ESG-Weak Exposures";
+run;
+data case_esg_lgd;
+    length stage $20 period $10;
+    input stage $ period $ lgd;
+    datalines;
+Early_Delinquency   Pre_Recovery   28
+Early_Delinquency   Post_Recovery  34
+Mid_Default         Pre_Recovery   42
+Mid_Default         Post_Recovery  51
+Late_Default        Pre_Recovery   63
+Late_Default        Post_Recovery  72
+Write_Off           Final_Loss     88
+;
+run;
+proc sgplot data=case_esg_lgd;
+    vbar stage / response=lgd group=period datalabel groupdisplay=cluster;
+    yaxis label="LGD (%)";
+    xaxis label="Recovery Stage";
+    title "LGD Escalation for ESG-Weak Exposures by Recovery Stage";
+run;
+proc print data=case_esg_pd noobs;
+    title "Monthly PD Trend – ESG Weak Portfolio";
+run;
+
+proc print data=case_esg_lgd noobs;
+    title "LGD Behaviour by Recovery Stage – ESG Weak Portfolio";
+run;
+
+data credit.crpi;
+    set credit.climate_combined_score_table;
+
+    CRPI = 0.35*PCCI 
+         + 0.25*TCCI
+         + 0.15*VULNCI
+         + 0.15*RCI
+         + 0.10*PCI;
+run;
+
+proc means data=credit.crpi noprint;
+    class region segment;
+    var CRPI;
+    output out=heatmap_region_segment mean=avg_crpi;
+run;
+
+proc sgplot data=heatmap_region_segment;
+    heatmap x=segment y=region colorresponse=avg_crpi / colormodel=(green yellow orange red);
+    title "Heatmap: CRPI by Region × Segment";
+run;
+proc means data=credit.crpi noprint;
+    class product_type;
+    var PCCI TCCI VULNCI RCI PCI CRPI;
+    output out=heatmap_product mean=;
+run;
+
+proc sgplot data=heatmap_product;
+    heatmap x=product_type y=_STAT_ colorresponse=MEAN / colormodel=(green yellow orange red);
+run;
+data credit.loss_projection;
+    set credit.crpi;
+
+    EL_mild     = PD*1.10 * LGD*0.95 * EAD*1.00;
+    EL_moderate = PD*1.20 * LGD*1.05 * EAD*1.10;
+    EL_severe   = PD*1.35 * LGD*1.20 * EAD*1.20;
+run;
+proc means data=credit.loss_projection noprint;
+    class segment;
+    var EL_mild EL_moderate EL_severe;
+    output out=heatmap_loss mean=;
+run;
+
+proc sgplot data=heatmap_loss;
+    heatmap x=segment y=_STAT_ colorresponse=MEAN / colormodel=(green yellow orange red);
+run;
+    by cust_id month;
+run;
+
+data crpi_delta;
+    set crpi_sorted;
+    by cust_id;
+
+    lag6_crpi = lag6(CRPI);
+
+    if first.cust_id then lag6_crpi = .;
+
+    delta_crpi = CRPI - lag6_crpi;
+run;
+
+Step 2 — Compute Climate Shock Factors
+data climate_shock;
+    set credit.physical_hazard_stage1;
+
+    physical_shock = (flood_index + heat_index + drought_index + storm_index + sealevel_index) / 5;
+    transition_shock = (energyshock_index + emiss_idx_100) / 2;
+
+    CSF = 0.4*physical_shock + 0.6*transition_shock;
+run;
+
+Step 3 — Behavioral Drift Index
+data behavior_drift;
+    set credit.pd_behavior;
+
+    BDI = 100 * ((behavior_score_current - behavior_score_baseline) /
+                 behavior_score_baseline);
+run;
+
+Step 4 — Portfolio Concentration Stress
+data portfolio_stress;
+    merge credit.sector_risk credit.region_risk credit.asset_risk;
+    by cust_id;
+
+    PCS = mean(sector_risk_index, region_risk_index, highrisk_asset_index);
+run;
+
+Step 5 — Islamic Modifier
+data islamic_modifier;
+    set credit.islamic_portfolio;
+
+    if product_type="Murabaha" then IRM = 6;
+    else if product_type="Ijara" then IRM = 8;
+    else if product_type="Mudarabah" then IRM = 4;
+    else IRM = 2;
+run;
+
+Step 6 — Final CCDS Score
+data EWS2_final;
+    merge crpi_delta climate_shock behavior_drift portfolio_stress islamic_modifier;
+    by cust_id;
+
+    CCDS = 0.30*delta_crpi 
+         + 0.25*CSF
+         + 0.20*BDI
+         + 0.15*PCS
+         + 0.10*IRM;
+run;
+
