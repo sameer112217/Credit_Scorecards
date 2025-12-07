@@ -1,0 +1,6 @@
+cust_id,region,infra_resilience_raw,financial_buffer_months_raw,insurance_coverage_pct_raw,bc_plan_maturity_raw,emergency_response_rating_raw,digital_resilience_score_raw,supply_chain_diversification_raw
+1,EastAfrica_Droug,3,1.5,20,2,3,3,1
+2,Gulf_Coast_Urban,6,4.0,55,5,6,5,3
+3,SE_Asia_StormBel,5,3.0,40,4,5,4,2
+4,South_Asia_Coast,7,6.0,70,7,7,7,4
+5,Gulf_Coast_Urban,8,8.0,85,8,8,8,5

@@ -1,0 +1,6 @@
+portfolio_id,segment,product_type,region,exposure_ead_mn_raw,baseline_pd_pct_raw,high_risk_share_pct_raw,green_exposure_pct_raw,top3_sector_concentration_pct_raw,climate_high_risk_obligors_count_raw,climate_stress_loss_pct_raw
+P01,Retail,Mortgage,South_Asia_Coast,850,1.2,28,12,55,320,4.5
+P02,SME,TermLoan,Gulf_Coast_Urban,420,1.8,35,8,62,210,5.8
+P03,Corporate,ProjectFinance,SE_Asia_StormBel,600,2.5,42,5,70,95,7.2
+P04,Retail,AutoLoan,EastAfrica_Droug,300,1.5,22,15,48,180,3.6
+P05,Corporate,WorkingCapital,Gulf_Coast_Urban,500,2.0,38,10,65,140,6.1

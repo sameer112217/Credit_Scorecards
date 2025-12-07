@@ -1,0 +1,6 @@
+cust_id,region,climate_policy_score_raw,disclosure_quality_raw,green_investment_ratio_raw,renewable_energy_share_raw,climate_governance_score_raw,data_system_readiness_raw,scenario_alignment_gap_pct_raw
+1,EastAfrica_Droug,3,2,0.05,12,3,2,35
+2,Gulf_Coast_Urban,6,5,0.12,28,6,5,18
+3,SE_Asia_StormBel,4,3,0.08,20,4,3,25
+4,South_Asia_Coast,7,6,0.18,35,7,6,12
+5,Gulf_Coast_Urban,8,7,0.25,42,8,7,8
